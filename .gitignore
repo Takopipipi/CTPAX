@@ -13,3 +13,6 @@ config.json
 *.etl
 *.pcap
 *.jsonl
+build/
+dist/
+*.spec

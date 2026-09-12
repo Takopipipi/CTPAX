@@ -235,6 +235,12 @@ async def run_suite(session):
     else:
         print("SKIP nuclei: binary/templates not installed")
 
+    # -- version lifecycle ------------------------------------------------------
+    # (passes both with and without a published release; "already_up_to_date" appears
+    # once the v-tag is on GitHub, "no_releases" before it)
+    check("version_check", await call("version_check", {}), contains="installed")
+    check("version_update_safe", await call("version_update", {}), contains="installed")
+
     # -- cdb session -------------------------------------------------------------
     cdb = Path(r"C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe")
     if cdb.exists():

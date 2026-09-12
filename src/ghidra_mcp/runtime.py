@@ -23,6 +23,13 @@ from ghidra_mcp.worker_client import WorkerClient
 INSTRUCTIONS = """\
 Reverse-engineering toolkit built on Ghidra, with PE triage, debugger bridges, and crypto.
 
+MANDATORY VERSION RULE: at the start of every session call `version_check`. If a tool
+response carries a CTPAX-MCP-OUTDATED notice or version_check says outdated: tell the
+user "I tried to use an outdated MCP version, updating...", run `version_update`, and
+after it succeeds tell the user to RESTART their AI client (OpenCode / Claude Code /
+Cursor / Codex) to load the new version - then retry the task. Do not silently keep
+using an outdated server.
+
 Suggested order of work on an unknown binary:
 1. `triage` - one call, the whole static picture: identity, packing, anti-debug map,
    heuristics verdict, score, next steps. Everything below drills into its findings.
@@ -149,7 +156,18 @@ def tool(*decorator_args: Any, **decorator_kwargs: Any) -> Callable[[Callable[..
             call = functools.partial(function, *args, **kwargs)
             # abandon_on_cancel: if the client gives up, stop waiting for the thread
             # rather than holding the loop until a slow Ghidra call finishes.
-            return await anyio.to_thread.run_sync(call, abandon_on_cancel=True)
+            result = await anyio.to_thread.run_sync(call, abandon_on_cancel=True)
+            # Version gate: a stale install stamps every response so no model can
+            # miss it - the notice is a cached, ~once-a-day network fact.
+            try:
+                from ghidra_mcp import version
+
+                notice = version.stale_notice()
+                if notice and isinstance(result, str):
+                    result = notice + "\n\n" + result
+            except Exception:
+                pass
+            return result
 
         # FastMCP builds the schema from the signature and docstring, which functools.wraps
         # already copied across; only the coroutine-ness differs from the original.

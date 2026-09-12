@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -448,6 +449,61 @@ class TestCTPAX(unittest.TestCase):
             self.assertEqual(path.read_text(encoding="utf-8").count("[mcp_servers.ghidra]"), 1)
             self.assertTrue(self.engine.unregister_from_codex(path))
             self.assertNotIn("ghidra", path.read_text(encoding="utf-8"))
+
+
+class TestVersion(unittest.TestCase):
+    def test_tuple_parse(self):
+        from ghidra_mcp import version
+
+        self.assertEqual(version._version_tuple("v1.2.3"), (1, 2, 3))
+        self.assertEqual(version._version_tuple("1.0.0"), (1, 0, 0))
+        self.assertEqual(version._version_tuple("release-2-1"), (2, 1, 0))
+
+    def test_outdated_with_patched_check(self):
+        from ghidra_mcp import version
+
+        saved, version._INMEMORY = version._INMEMORY, None
+        saved_check = version.check
+        try:
+            version.check = lambda force=False: {"installed": "1.0.0", "latest": "1.0.1", "checked_at": time.time()}
+            fact = version.outdated()
+            self.assertIsNotNone(fact)
+            self.assertEqual(fact["latest"], "1.0.1")
+            notice = version.stale_notice()
+            self.assertIn("CTPAX-MCP-OUTDATED", notice)
+            self.assertIn("version_update", notice)
+            version.check = lambda force=False: {"installed": "1.0.1", "latest": "1.0.1", "checked_at": time.time()}
+            self.assertIsNone(version.outdated())
+            self.assertEqual(version.stale_notice(), "")
+            version.check = lambda force=False: {"installed": "1.0.0", "latest": None, "error": "offline"}
+            self.assertIsNone(version.outdated())
+        finally:
+            version.check = saved_check
+            version._INMEMORY = saved
+
+    def test_cache_roundtrip(self):
+        from ghidra_mcp import version
+
+        saved_home = os.environ.get("GHIDRA_MCP_HOME")
+        with tempfile.TemporaryDirectory() as tmp:
+            os.environ["GHIDRA_MCP_HOME"] = tmp
+            saved, version._INMEMORY = version._INMEMORY, None
+            saved_check = version.check
+            try:
+                version.check = lambda force=False: {"installed": "1.0.0", "latest": "9.9.9", "checked_at": time.time()}
+                path = version._cache_path()
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(version.check()), encoding="utf-8")
+                self.assertTrue(path.is_file())
+                stored = json.loads(path.read_text(encoding="utf-8"))
+                self.assertEqual(stored["latest"], "9.9.9")
+            finally:
+                version.check = saved_check
+                version._INMEMORY = saved
+            if saved_home is not None:
+                os.environ["GHIDRA_MCP_HOME"] = saved_home
+            else:
+                del os.environ["GHIDRA_MCP_HOME"]
 
 
 if __name__ == "__main__":

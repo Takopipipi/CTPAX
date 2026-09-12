@@ -30,9 +30,13 @@ from ghidra_mcp import tools_x64dbg  # noqa: F401
 from ghidra_mcp import tools_ghidra  # noqa: F401
 from ghidra_mcp import tools_pentest  # noqa: F401
 from ghidra_mcp import tools_nuclei  # noqa: F401
+from ghidra_mcp import tools_version  # noqa: F401
 
 
 def main() -> None:
+    from ghidra_mcp import version
+
+    version.prefetch()  # background GitHub check so the first tool call is not delayed
     problems = SETTINGS.problems()
     for problem in problems:
         # Warn but start anyway: the static and crypto tools work without Ghidra, and the
@@ -40,6 +44,7 @@ def main() -> None:
         print(f"[ghidra-mcp] warning: {problem}", file=sys.stderr)
     print(
         "[ghidra-mcp] ready"
+        f" v{version.__version__}"
         f" ghidra={SETTINGS.ghidra_dir}"
         f" java={SETTINGS.java_home}"
         f" home={SETTINGS.home}",

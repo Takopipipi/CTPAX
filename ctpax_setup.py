@@ -179,6 +179,31 @@ def load_engine() -> object:
     return module
 
 
+def extract_bundled_project(destination: Path) -> Path:
+    """Frozen exe mode: unpack the project zip embedded in the binary.
+
+    build_release.py packs the whole source tree as CTPAX-project.zip and PyInstaller
+    ships it inside the exe; at run time it lands in CTPAX\\installer and the engine
+    loads from there, so the single exe is genuinely self-contained.
+    """
+    bundle = Path(getattr(sys, "_MEIPASS", ".")) / "CTPAX-project.zip"
+    if not bundle.is_file():
+        raise FileNotFoundError("the exe has no embedded project payload")
+    destination.mkdir(parents=True, exist_ok=True)
+    import zipfile
+
+    with zipfile.ZipFile(bundle) as archive:
+        archive.extractall(destination)
+    return destination
+
+
+def get_installer_dir(target_root: Path) -> Path:
+    """Where install.py lives for this run: extracted payload (exe) or file copy (bat)."""
+    if getattr(sys, "frozen", False):
+        return extract_bundled_project(target_root / "installer")
+    return self_copy_into(target_root)
+
+
 def self_copy_into(target: Path) -> Path:
     """Copy this project (everything except caches) into CTPAX\\installer and return it."""
     source = Path(__file__).resolve().parent
@@ -251,9 +276,9 @@ def main() -> int:
         print("  --check: nothing installed.", flush=True)
         return 0
 
-    # --- phase 3: copy into CTPAX ---
-    print(f"\n  {c('1/2')} copying the project into {target_root}\\installer ...", flush=True)
-    engine_dir = self_copy_into(target_root)
+    # --- phase 3: lay the sources down (embedded zip for the exe, file copy for the bat)
+    print(f"\n  {c('1/2')} laying the project into {target_root}\\installer ...", flush=True)
+    engine_dir = get_installer_dir(target_root)
     print(f"      {ok_text('done')}", flush=True)
 
     # --- phase 4: run the engine with progress ---
