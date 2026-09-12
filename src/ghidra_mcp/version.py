@@ -175,7 +175,7 @@ def update(*, timeout: float = 300.0) -> dict[str, Any]:
         return {"error": f"cannot determine the latest version: {info.get('error') or 'unreachable'}"}
     fact = outdated()
     if fact is None:
-        return {"already_up_to_date": True, "version": __version__, "latest": latest}
+        return {"already_up_to_date": True, "installed": __version__, "version": __version__, "latest": latest}
 
     import shutil
     import tempfile
