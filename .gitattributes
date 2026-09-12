@@ -1,0 +1,7 @@
+* text=auto
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.py text eol=lf
+*.c text eol=lf
+*.md text eol=lf
+*.dll binary
