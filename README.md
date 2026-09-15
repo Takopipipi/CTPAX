@@ -12,7 +12,7 @@ static binary analysis without Ghidra, crypto utilities, license-gate auto-disco
 paste-ready patch suggestions, cross-build function mapping and PE diffing, Unity Il2Cpp
 metadata dumps, in-process exception logging without a debugger, minidump forensics,
 Metasploit, Wireshark (tshark/dumpcap) traffic analysis, and Nuclei vulnerability
-scanning. 248 tools.
+scanning. 250 tools.
 
 Key idea: analysis **persists**. A binary is imported into a Ghidra project under a name
 derived from its SHA-256, so re-opening the same file is instant, and all renames,

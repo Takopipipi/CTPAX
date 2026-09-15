@@ -6,6 +6,8 @@ decide which tool to use, so they say when to reach for each one, not merely wha
 
 from __future__ import annotations
 
+import os
+
 from typing import Any
 
 from ghidra_mcp.runtime import clean, ghidra, mcp
@@ -37,9 +39,23 @@ def open_binary(
     ``list_programs``). ``language`` is only needed for raw images Ghidra cannot identify,
     e.g. ``ARM:LE:32:v8`` for bare firmware. ``reimport`` discards previous analysis.
 
-    For a large binary, prefer ``job_start('open_binary', {...})`` so the call does not block.
+    Files over ~2.5MB are imported WITHOUT auto-analysis (the analyze pass on a 4MB+
+    binary can wedge the Ghidra worker and the whole machine for minutes, and the client
+    call times out). The import result says so; then either run
+    ``job_start('analyze_program', {...})`` and poll ``job_status``, or pass
+    ``analyze=True`` anyway accepting the wait. For a large first import,
+    ``job_start('open_binary', {...})`` is the non-blocking route.
     """
-    return ghidra(
+    downgraded = False
+    if path and analyze:
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = 0
+        if size > 2_500_000:
+            analyze = False
+            downgraded = True
+    result = ghidra(
         "open",
         clean(
             {
@@ -55,6 +71,14 @@ def open_binary(
         ),
         timeout=timeout,
     )
+    if downgraded:
+        result = (
+            "NOTE: the file is large - auto-analysis was skipped so the worker does not "
+            "wedge. Imported ready for inspection; start analysis with "
+            "job_start('analyze_program', {...}) and poll job_status, then continue "
+            "(decompile/xrefs work on whatever is already analyzed).\n\n"
+        ) + result
+    return result
 
 
 @mcp.tool()

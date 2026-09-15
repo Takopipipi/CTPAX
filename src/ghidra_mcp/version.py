@@ -22,7 +22,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 REPO = "Takopipipi/CTPAX"
 _RELEASE_API = f"https://api.github.com/repos/{REPO}/releases/latest"
@@ -145,16 +145,39 @@ def outdated() -> dict[str, Any] | None:
     return None
 
 
-def stale_notice() -> str:
-    """One-line instruction text for the model, or empty when up to date/unknown.
+def _peek() -> dict[str, Any] | None:
+    """The cached check without any network: in-memory, then disk. None when unknown."""
+    if _INMEMORY is not None and _INMEMORY.get("latest"):
+        return _INMEMORY
+    try:
+        cache_file = _cache_path()
+        if cache_file.is_file():
+            stored = json.loads(cache_file.read_text(encoding="utf-8"))
+            if stored.get("latest") and time.time() - float(stored.get("checked_at", 0)) < _CACHE_TTL:
+                return stored
+    except (OSError, ValueError):
+        pass
+    return None
 
-    Called at most once per tool response (the check itself is cached in memory and
-    on disk), so the model cannot miss it while using an old build.
+
+def stale_notice() -> str:
+    """One-line instruction text for the model, or empty when fresh/unknown.
+
+    NEVER blocks on the network: a response path only reads the cache, and an unknown
+    state triggers a background prefetch (the startup one already covers session start).
+    A hung proxy therefore cannot slow down a single tool call.
     """
-    fact = outdated()
-    if fact is None:
+    info = _peek()
+    if info is None:
+        prefetch()
         return ""
-    return _STALE_NOTICE.format(**fact)
+    installed, latest = info.get("installed"), info.get("latest")
+    try:
+        if latest and _version_tuple(latest) > _version_tuple(installed):
+            return _STALE_NOTICE.format(installed=installed, latest=latest)
+    except ValueError:
+        pass
+    return ""
 
 
 # --------------------------------------------------------------------------
