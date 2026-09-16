@@ -22,7 +22,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-__version__ = "1.0.4"
+__version__ = "1.0.5"
 
 REPO = "Takopipipi/CTPAX"
 _RELEASE_API = f"https://api.github.com/repos/{REPO}/releases/latest"
@@ -54,9 +54,34 @@ def _version_tuple(tag: str) -> tuple[int, ...]:
     return tuple(int(g) for g in core.groups())
 
 
+def _tag_from_redirect(timeout: float = 8.0) -> str | None:
+    """Fallback that survives GitHub's 60/hour anonymous API limit.
+
+    ``https://github.com/<repo>/releases/latest`` answers 302 with
+    ``Location: .../tag/vX.Y.Z`` - no API quota involved.
+    """
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102
+            raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
+
+    opener = urllib.request.build_opener(_NoRedirect)
+    request = urllib.request.Request(f"https://github.com/{REPO}/releases/latest", headers={"User-Agent": "CTPAX-MCP"})
+    try:
+        opener.open(request, timeout=timeout)
+        return None
+    except urllib.error.HTTPError as exc:
+        location = exc.headers.get("Location") if exc.headers else None
+        if location and "/tag/" in location:
+            tag = location.rsplit("/tag/", 1)[-1].strip().strip("/")
+            return tag or None
+        return None
+    except Exception:
+        return None
+
+
 def _fetch_latest(timeout: float = 8.0) -> tuple[str | None, bool]:
     """(tag, no_releases_yet). 404 from the latest-release API means zero releases,
-    which is "up to date", not a failure."""
+    which is "up to date", not a failure; a quota error falls back to the redirect."""
     request = urllib.request.Request(_RELEASE_API, headers={"User-Agent": "CTPAX-MCP", "Accept": "application/vnd.github+json"})
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -66,9 +91,13 @@ def _fetch_latest(timeout: float = 8.0) -> tuple[str | None, bool]:
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
             return (None, True)
+        if exc.code in (403, 429):  # rate limited: the redirect route has no quota
+            tag = _tag_from_redirect(timeout)
+            return (tag, False)
         return (None, False)
     except Exception:
-        return (None, False)
+        tag = _tag_from_redirect(timeout)
+        return (tag, False)
 
 
 def _check_raw(force: bool = False) -> dict[str, Any]:
