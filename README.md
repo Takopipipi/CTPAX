@@ -31,6 +31,7 @@ downloaded into the toolkit folder automatically:
 
 - **Ghidra** (latest release, ~540MB) -> `<drive>:\CTPAX\ghidra`
 - **JDK 21** (Eclipse Temurin, ~200MB) -> `<drive>:\CTPAX\jdk`
+- **Python 3.12** (python.org installer) -> `<drive>:\CTPAX\python`, when the machine has none to build the venv from
 - **x64dbg** (latest snapshot) -> `<drive>:\CTPAX\x64dbg`, plus the automation plugin and ScyllaHide
 - **Nuclei** + its ~13k template repo, **Wireshark** CLI tools (winget)
 - venv + Python dependencies for the server itself

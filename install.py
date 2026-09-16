@@ -398,7 +398,10 @@ def check_python() -> None:
     out.step("Checking Python")
     if sys.version_info < MIN_PYTHON:
         die(f"Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]}+ is required; this is {sys.version.split()[0]}")
-    out.ok(f"Python {sys.version.split()[0]} at {sys.executable}")
+    if getattr(sys, "frozen", False):
+        out.ok(f"Python {sys.version.split()[0]} (bundled in CTPAX-Setup.exe)")
+    else:
+        out.ok(f"Python {sys.version.split()[0]} at {sys.executable}")
 
 
 def check_install_path(home: Path) -> None:
@@ -421,6 +424,72 @@ def check_install_path(home: Path) -> None:
 # --------------------------------------------------------------------------
 # environment build
 # --------------------------------------------------------------------------
+def _usable_python(command: list[str]) -> bool:
+    """Does this python exist and meet the minimum version?"""
+    try:
+        result = subprocess.run(
+            [*command, "-c", "import sys; print('%d.%d' % sys.version_info[:2])"],
+            capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if result.returncode != 0:
+        return False
+    try:
+        major, minor = (int(part) for part in result.stdout.strip().split("."))
+    except ValueError:
+        return False
+    return (major, minor) >= MIN_PYTHON
+
+
+def find_real_python() -> list[str] | None:
+    """A real interpreter for creating the venv.
+
+    Frozen builds (CTPAX-Setup.exe) are not a python interpreter: ``sys.executable``
+    there cannot run ``-m venv``, so a system Python is located instead - and if the
+    machine has none at all, one is installed from python.org.
+    """
+    candidates: list[list[str]] = []
+    if not getattr(sys, "frozen", False):
+        candidates.append([sys.executable])
+    candidates += [["py", "-3"], ["python"], ["python3"]]
+    bundled = prereq_dir() / "python" / "python.exe"
+    if bundled.is_file():
+        candidates.append([str(bundled)])
+    for candidate in candidates:
+        if _usable_python(candidate):
+            return candidate
+    return None
+
+
+def install_python(target_dir: Path) -> list[str] | None:
+    """Install a private Python 3.12 from python.org (silent, no PATH changes)."""
+    for version in ("3.12.10", "3.12.9", "3.12.8", "3.12.7"):
+        installer = prereq_dir() / "_python_setup.exe"
+        url = f"https://www.python.org/ftp/python/{version}/python-{version}-amd64.exe"
+        try:
+            out.info(f"no Python on this machine - installing Python {version} into {target_dir}")
+            download_file(url, installer, f"Python {version}", timeout=900)
+            result = subprocess.run(
+                [str(installer), "/quiet", "InstallAllUsers=0", f"TargetDir={target_dir}",
+                 "Include_pip=1", "Include_launcher=0", "PrependPath=0", "Include_test=0", "SimpleInstall=1"],
+                capture_output=True, text=True, timeout=1800, stdin=subprocess.DEVNULL,
+            )
+            executable = target_dir / "python.exe"
+            if executable.is_file() and _usable_python([str(executable)]):
+                out.ok(f"Python {version} installed: {executable}")
+                return [str(executable)]
+            out.warn(f"Python installer exited {result.returncode} but {executable} is not usable")
+        except Exception as exc:
+            out.warn(f"could not install Python {version} ({exc})")
+        finally:
+            try:
+                installer.unlink(missing_ok=True)
+            except OSError:
+                pass
+    return None
+
+
 def build_venv(home: Path, *, recreate: bool) -> Path:
     out.step("Creating the virtual environment")
     venv = home / "venv"
@@ -435,7 +504,13 @@ def build_venv(home: Path, *, recreate: bool) -> Path:
         return python
 
     home.mkdir(parents=True, exist_ok=True)
-    result = subprocess.run([sys.executable, "-m", "venv", str(venv)], capture_output=True, text=True)
+    base = find_real_python()
+    if base is None:
+        base = install_python(prereq_dir() / "python")
+    if base is None:
+        die("no usable Python 3.10+ could be found or installed; install Python from python.org and re-run")
+    out.info(f"base interpreter: {' '.join(base)}")
+    result = subprocess.run([*base, "-m", "venv", str(venv)], capture_output=True, text=True, stdin=subprocess.DEVNULL)
     if result.returncode != 0 or not python.exists():
         die(f"could not create a virtual environment at {venv}\n{result.stderr.strip()[:800]}")
     out.ok(str(venv))
@@ -1661,6 +1736,20 @@ def do_install(arguments: argparse.Namespace) -> int:
         "claude": bool(arguments.claude or arguments.all_clients),
         "codex": bool(arguments.codex or arguments.all_clients),
     }
+    if getattr(arguments, "no_register", False):
+        out.warn("--no-register: AI client configs are left untouched")
+        _tick("registrations skipped", 0.98)
+        print()
+        print("=" * 72)
+        print("  Installed" + ("" if verified else " (with warnings)"))
+        print("=" * 72)
+        print(f"  Ghidra          {ghidra_dir}")
+        print(f"  Java            {java_home}")
+        print(f"  Install home    {home}")
+        print(f"  Projects        {home / 'projects'}")
+        print("  Register later: re-run without --no-register, or add the block from README.md")
+        _tick("done", 1.0)
+        return 0 if verified else 1
     if arguments.all_clients:
         _tick(f"clients detected: {', '.join(n for n, yes in clients.items() if yes) or 'opencode only'}", 0.86)
 
@@ -1839,6 +1928,7 @@ def main() -> int:
     parser.add_argument("--offline", action="store_true", help="do not install packages")
     parser.add_argument("--skip-verify", action="store_true", help="do not start the server to verify")
     parser.add_argument("--force", action="store_true", help="register in OpenCode even if verification fails")
+    parser.add_argument("--no-register", action="store_true", help="install only; never touch AI client configs")
     arguments = parser.parse_args()
 
     try:

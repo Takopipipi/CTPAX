@@ -59,15 +59,17 @@ def ensure_pyinstaller() -> None:
 
 
 def _runtime_imports() -> list[str]:
-    """Top-level package names that install.py (and its config helper) import.
+    """Every module (dotted, e.g. urllib.request) that install.py imports at runtime.
 
     install.py is loaded at runtime by the frozen exe, so PyInstaller cannot see its
-    imports: without this list the exe starts, extracts the payload and then dies on
-    ``ModuleNotFoundError: No module named 'json'``.
+    imports: the top-level package alone is not enough - ``urllib`` without
+    ``urllib.request`` produced "No module named 'urllib.request'" on a clean machine.
+    Nested (function-level) imports are collected too, because that is exactly how the
+    download helpers import urllib.
     """
     import ast
 
-    packages: set[str] = set()
+    modules: set[str] = set()
     sources = [ROOT / "install.py", ROOT / "ctpax_setup.py", ROOT / "src" / "ghidra_mcp" / "config.py"]
     for source in sources:
         if not source.is_file():
@@ -76,11 +78,16 @@ def _runtime_imports() -> list[str]:
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
-                    packages.add(alias.name.split(".")[0])
+                    modules.add(alias.name)
             elif isinstance(node, ast.ImportFrom) and node.module:
-                packages.add(node.module.split(".")[0])
-    # ghidra_mcp is a local package shipped in the payload; everything else must be bundled
-    return sorted(name for name in packages if name != "ghidra_mcp")
+                modules.add(node.module)
+    # keep the top-level package too, and drop the local package (shipped in the payload)
+    expanded = set(modules)
+    for name in modules:
+        expanded.add(name.split(".")[0])
+    # submodules reached through attribute access (ctypes.wintypes) never show up in AST
+    expanded.update({"ctypes.wintypes", "winreg", "urllib.error", "urllib.parse", "http.client", "email.message"})
+    return sorted(name for name in expanded if name.split(".")[0] != "ghidra_mcp")
 
 
 def build() -> Path:

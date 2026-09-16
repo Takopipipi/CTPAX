@@ -446,8 +446,18 @@ class TestCTPAX(unittest.TestCase):
 
     def test_auto_install_helpers_exist(self):
         # the install path must be able to fetch every prerequisite itself
-        for name in ("install_ghidra", "install_jdk", "install_x64dbg", "download_file"):
+        for name in ("install_ghidra", "install_jdk", "install_x64dbg", "download_file",
+                     "install_python", "find_real_python", "_usable_python", "build_venv",
+                     "prereq_dir"):
             self.assertTrue(callable(getattr(self.engine, name)), name)
+
+    def test_real_python_is_found_and_usable(self):
+        found = self.engine.find_real_python()
+        self.assertIsNotNone(found, "no usable Python on PATH (needed to create the venv)")
+        self.assertTrue(self.engine._usable_python(found))
+
+    def test_usable_python_rejects_nonsense(self):
+        self.assertFalse(self.engine._usable_python(["definitely-not-a-python-xyz"]))
 
     def test_claude_registration_roundtrip(self):
         with tempfile.TemporaryDirectory() as tmp:

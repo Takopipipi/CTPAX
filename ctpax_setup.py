@@ -257,7 +257,7 @@ def is_admin() -> bool:
 
 def relaunch_as_admin() -> bool:
     """Re-run this installer elevated (UAC). True when a new instance was started."""
-    if os.name != "nt" or is_admin():
+    if os.name != "nt" or is_admin() or os.environ.get("CTPAX_NO_ELEVATE"):
         return False
     if getattr(sys, "frozen", False):
         executable = sys.executable
@@ -279,14 +279,17 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="CTPAX installer")
     parser.add_argument("--check", action="store_true", help="show the plan, install nothing")
     parser.add_argument("--engine-only", action="store_true", help="lay the sources down, load the engine, then stop (self-test)")
+    parser.add_argument("--selftest", action="store_true", help="check that the frozen build can import everything the engine needs")
+    parser.add_argument("--home", help="CTPAX root override (default: biggest fixed drive, <drive>:\\CTPAX)")
+    parser.add_argument("--no-register", action="store_true", help="install only; do not touch any AI client config (for sandbox tests)")
     parser.add_argument("--recreate-venv", action="store_true", help="rebuild the virtual environment")
     parser.add_argument("--offline", action="store_true", help="skip all downloads")
     args = parser.parse_args()
 
     _enable_vt()
 
-    # --- phase 0: elevation (the real installs need admin; --check stays clean) ---
-    if not args.check and not args.engine_only and relaunch_as_admin():
+    # --- phase 0: elevation (the real installs need admin; checks stay unelevated) ---
+    if not (args.check or args.engine_only or args.selftest) and relaunch_as_admin():
         print(c("  restarting elevated (UAC accepted) - continuing in the new window ..."))
         return 0
 
@@ -316,13 +319,13 @@ def main() -> int:
     print("  Drives:", flush=True)
     for drive in drives[:6]:
         need = 12
-        marker = ok_text(" <- CTPAX here") if drive is biggest else (dim("   (too full)") if drive["free_gb"] < need else "")
+        marker = ok_text(" <- CTPAX here") if (drive is biggest and not args.home) else (dim("   (too full)") if drive["free_gb"] < need else "")
         print(f"   {c(drive['root']):<5} free {drive['free_gb']:7.1f} GB / {drive['total_gb']:6.1f} GB  [{mini_bar(drive['free_gb'] / max(1, drive['total_gb']), 14)}]{marker}", flush=True)
-    if biggest["free_gb"] < 12:
+    if biggest["free_gb"] < 12 and not args.home:
         print("\n  Not enough free space: the toolkit (venv + Ghidra projects + Nuclei templates) needs ~12 GB.", file=sys.stderr)
         return 1
 
-    target_root = Path(biggest["root"]) / "CTPAX"
+    target_root = Path(args.home).expanduser().resolve() if args.home else (Path(biggest["root"]) / "CTPAX")
     home = target_root / "GhidraMCP"
     print(dim(f"  plan: copy installer -> {target_root}\\installer, everything -> {home}"), flush=True)
 
@@ -350,6 +353,27 @@ def main() -> int:
         print(f"  {ok_text('engine loaded')} from {engine_dir} (--engine-only: stopping here)")
         return 0
 
+    if args.selftest:
+        probes = [
+            "json", "zipfile", "tempfile", "shutil", "subprocess", "dataclasses",
+            "urllib.request", "urllib.error", "urllib.parse", "http.client", "ssl",
+            "socket", "email.message", "ctypes.wintypes", "importlib.util",
+        ]
+        missing = []
+        import importlib
+
+        for name in probes:
+            try:
+                importlib.import_module(name)
+            except Exception as exc:
+                missing.append(f"{name} ({exc})")
+        if missing:
+            print(f"  {YELLOW}missing runtime modules: {', '.join(missing)}{RESET}")
+            print("  this build is broken - rebuild the exe")
+            return 1
+        print(f"  {ok_text('selftest passed')}: all {len(probes)} runtime modules importable")
+        return 0
+
     bar = Progress()
     engine.PROGRESS = bar.set
     namespace = argparse.Namespace(
@@ -358,7 +382,8 @@ def main() -> int:
         ghidra=None,
         java=None,
         opencode_config=None, cursor=False, cursor_config=None,
-        claude=False, codex=False, all_clients=True,
+        claude=False, codex=False, all_clients=not args.no_register,
+        no_register=args.no_register,
         yes=True,
         heap=os.environ.get("CTPAX_HEAP", "4G"),
         recreate_venv=args.recreate_venv, offline=args.offline,
