@@ -19,11 +19,92 @@ from ghidra_mcp.ghidra_ops import (
 
 
 @op("strings")
+def _read_string_at(memory: Any, address: Any, charset: str, *, limit: int = 512) -> str:
+    """Read a NUL-terminated string around a memory hit (ascii or utf-16)."""
+    try:
+        raw = bytearray()
+        for offset in range(0, limit, 2):
+            chunk = memory.getByte(address.add(offset))
+            raw.append(chunk & 0xFF)
+            if charset == "utf-16" and len(raw) >= 2:
+                if raw[-1] == 0 and raw[-2] == 0:
+                    break
+            elif charset != "utf-16" and chunk == 0:
+                break
+        data = bytes(raw)
+        if charset == "utf-16":
+            return data.decode("utf-16-le", "replace").rstrip("\x00")
+        return data.decode("latin-1", "replace")
+    except Exception:
+        return ""
+
+
+def _raw_string_search(session: Session, program: Any, needle: str, limit: int,
+                       collected: list[dict[str, Any]], case_sensitive: bool) -> None:
+    """Look for the filter as ASCII and UTF-16LE inside raw memory.
+
+    Ghidra's ``getDefinedData`` only returns strings something already *defined*; on
+    stripped or packed images a perfectly visible UTF-16 literal is not in that list,
+    which is why ``filter="usage"`` returned nothing on where.exe. This scans memory.
+    """
+    from ghidra.program.model.data import StringDataInstance  # type: ignore
+
+    from ghidra_mcp.ghidra_ops import to_jbytes
+
+    memory = program.getMemory()
+    reference_manager = program.getReferenceManager()
+    function_manager = program.getFunctionManager()
+    variants: list[tuple[str, bytes]] = []
+    for label, encoding in (("ascii", "latin-1"), ("utf-16", "utf-16-le")):
+        try:
+            text = needle if case_sensitive else needle
+            variants.append((label, text.encode(encoding, "ignore")))
+        except Exception:
+            continue
+    for charset, raw in variants:
+        if not raw:
+            continue
+        java_needle = to_jbytes(raw)
+        start = program.getMinAddress()
+        while len(collected) < limit:
+            session.check_cancel()
+            try:
+                found = memory.findBytes(start, java_needle, None, True, session.monitor())
+            except Exception:
+                break
+            if found is None:
+                break
+            value = _read_string_at(memory, found, charset)
+            if len(value) >= 2:
+                record: dict[str, Any] = {
+                    "address": str(found),
+                    "value": value,
+                    "length": len(value),
+                    "charset": charset,
+                    "data_type": "raw-search",
+                    "references": [],
+                    "reference_count": 0,
+                }
+                holder = function_manager.getFunctionContaining(found)
+                if holder is not None:
+                    record["function"] = str(holder.getName())
+                collected.append(record)
+            try:
+                start = found.add(1)
+            except Exception:
+                break
+
+
 def strings(session: Session, params: dict[str, Any], progress: Callable[..., None]) -> dict[str, Any]:
     """Defined strings, with the functions that reference them.
 
     ``with_refs`` is the reason to prefer this over a raw ``strings`` dump: knowing
     which function reaches "license invalid" is usually the entire point.
+
+    When ``filter`` matches nothing among Ghidra's defined strings - common on stripped
+    images, where UTF-16 literals are not defined at all - a raw memory search runs in
+    both encodings and reports those hits (``data_type: raw-search``). ``deep=True``
+    forces that extra pass even when some defined strings matched.
     """
     entry = session.resolve(params)
     program = entry.program
@@ -34,6 +115,7 @@ def strings(session: Session, params: dict[str, Any], progress: Callable[..., No
     pattern = re.compile(params.get("regex")) if params.get("regex") else None
     with_refs = bool(params.get("with_refs", True))
     case_sensitive = bool(params.get("case_sensitive", False))
+    deep = bool(params.get("deep", False))
 
     from ghidra.program.model.data import StringDataInstance  # type: ignore
 
@@ -85,6 +167,11 @@ def strings(session: Session, params: dict[str, Any], progress: Callable[..., No
             record["reference_count"] = len(referrers)
         collected.append(record)
 
+    searched_memory = False
+    if name_filter and (deep or not collected):
+        searched_memory = True
+        _raw_string_search(session, program, str(name_filter), limit + offset, collected, case_sensitive)
+
     total = len(collected)
     page = collected[offset : offset + limit]
     return {
@@ -93,6 +180,7 @@ def strings(session: Session, params: dict[str, Any], progress: Callable[..., No
         "offset": offset,
         "returned": len(page),
         "next_offset": (offset + len(page)) if offset + len(page) < total else None,
+        "memory_search_used": searched_memory,
         "strings": page,
     }
 

@@ -1,4 +1,4 @@
-"""Version awareness: the server knows which build it is, checks the public GitHub
+﻿"""Version awareness: the server knows which build it is, checks the public GitHub
 release feed (cached, 24h TTL), and hands the model an unmissable notice when the
 installed copy is outdated.
 
@@ -22,7 +22,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-__version__ = "1.0.7"
+__version__ = "1.1.0"
 
 REPO = "Takopipipi/CTPAX"
 _RELEASE_API = f"https://api.github.com/repos/{REPO}/releases/latest"
@@ -189,14 +189,17 @@ def prefetch() -> None:
 
 
 def outdated() -> dict[str, Any] | None:
-    """The comparison fact: {installed, latest} when a newer release exists."""
+    """The comparison fact: {installed, latest} when a newer release exists.
+
+    ``installed`` is the running build, never the cached copy of it.
+    """
     info = check()
-    installed, latest = info.get("installed"), info.get("latest")
+    latest = info.get("latest")
     if not latest:
         return None
     try:
-        if _version_tuple(latest) > _version_tuple(installed):
-            return {"installed": installed, "latest": latest}
+        if _version_tuple(latest) > _version_tuple(__version__):
+            return {"installed": __version__, "latest": latest}
     except ValueError:
         return None
     return None
@@ -220,18 +223,19 @@ def _peek() -> dict[str, Any] | None:
 def stale_notice() -> str:
     """One-line instruction text for the model, or empty when fresh/unknown.
 
-    NEVER blocks on the network: a response path only reads the cache, and an unknown
-    state triggers a background prefetch (the startup one already covers session start).
-    A hung proxy therefore cannot slow down a single tool call.
+    NEVER blocks on the network (cache only; an unknown state triggers a background
+    prefetch). The comparison always uses the RUNNING ``__version__`` - the ``installed``
+    field in the cache is stale right after a successful update and would keep the
+    notice alive for the rest of the TTL.
     """
     info = _peek()
     if info is None:
         prefetch()
         return ""
-    installed, latest = info.get("installed"), info.get("latest")
+    latest = info.get("latest")
     try:
-        if latest and _version_tuple(latest) > _version_tuple(installed):
-            return _STALE_NOTICE.format(installed=installed, latest=latest)
+        if latest and _version_tuple(latest) > _version_tuple(__version__):
+            return _STALE_NOTICE.format(installed=__version__, latest=latest)
     except ValueError:
         pass
     return ""

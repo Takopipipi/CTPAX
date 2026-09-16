@@ -48,6 +48,14 @@ def doctor() -> str:
     report["python"] = {"executable": sys.executable, "version": sys.version.split()[0]}
     report["worker"] = WORKER.describe()
 
+    from ghidra_mcp import version as version_module
+
+    report["version"] = {
+        "installed": version_module.__version__,
+        "latest": (version_module._peek() or {}).get("latest"),
+        "outdated": bool(version_module.outdated()),
+    }
+
     if not SETTINGS.problems():
         try:
             ready = WORKER.start()

@@ -10,6 +10,7 @@ import functools
 import inspect
 import json
 import os
+import threading
 from typing import Any, Callable
 
 import anyio.to_thread
@@ -157,14 +158,17 @@ def tool(*decorator_args: Any, **decorator_kwargs: Any) -> Callable[[Callable[..
             # abandon_on_cancel: if the client gives up, stop waiting for the thread
             # rather than holding the loop until a slow Ghidra call finishes.
             result = await anyio.to_thread.run_sync(call, abandon_on_cancel=True)
-            # Version gate: a stale install stamps every response so no model can
-            # miss it - the notice is a cached, ~once-a-day network fact.
+            # Version gate: an outdated install adds a SECOND content block after the
+            # payload. Never prepend it to the text itself - strict clients and the
+            # installer's smoke test parse content[0] as JSON and would break.
             try:
                 from ghidra_mcp import version
 
                 notice = version.stale_notice()
-                if notice and isinstance(result, str):
-                    result = notice + "\n\n" + result
+                if notice:
+                    from mcp.types import TextContent
+
+                    return [TextContent(type="text", text=str(result)), TextContent(type="text", text=notice)]
             except Exception:
                 pass
             return result
@@ -207,6 +211,22 @@ def fail(exc: Exception, *, hint: str = "") -> str:
     if trace and os.environ.get("GHIDRA_MCP_DEBUG") == "1":
         payload["trace"] = trace
     return render(payload)
+
+
+def warm_worker() -> None:
+    """Start the Ghidra worker (and its JVM) in the background at server startup.
+
+    The first ghidra_* call otherwise pays the whole pyghidra boot (~20-60s, more on a
+    slow VM) inside the client's request timeout - the usual "-32001 / Request timed
+    out" report. A daemon thread absorbs that cost while the model reads the tool list.
+    """
+    def _boot() -> None:
+        try:
+            WORKER.ping()
+        except Exception:
+            pass  # doctor reports the real problem when a tool is actually called
+
+    threading.Thread(target=_boot, name="ctpax-worker-warmup", daemon=True).start()
 
 
 def ghidra(op: str, params: dict[str, Any] | None = None, *, timeout: float | None = None) -> str:

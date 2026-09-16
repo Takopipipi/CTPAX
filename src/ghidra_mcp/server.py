@@ -35,10 +35,19 @@ from ghidra_mcp import tools_version  # noqa: F401
 
 def main() -> None:
     from ghidra_mcp import version
+    from ghidra_mcp.runtime import warm_worker
 
     version.prefetch()  # background GitHub check so the first tool call is not delayed
-    problems = SETTINGS.problems()
-    for problem in problems:
+    warm_worker()  # boot the Ghidra worker + JVM while the client reads the tool list
+    if version.outdated():
+        fact = version.outdated() or {}
+        print(
+            f"[ghidra-mcp] OUTDATED: v{fact.get('installed')} -> {fact.get('latest')}; "
+            "call version_update, then restart the AI client (a second content block in "
+            "tool responses repeats this).",
+            file=sys.stderr,
+        )
+    for problem in SETTINGS.problems():
         # Warn but start anyway: the static and crypto tools work without Ghidra, and the
         # doctor tool has to be reachable to explain what is missing.
         print(f"[ghidra-mcp] warning: {problem}", file=sys.stderr)

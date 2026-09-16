@@ -24,8 +24,9 @@ def open_binary(
     language: str | None = None,
     compiler: str | None = None,
     loader: str | None = None,
-    name: str | None = None,
+name: str | None = None,
     reimport: bool = False,
+    pdb: bool = False,
     timeout: float = 1800.0,
 ) -> str:
     """Import a binary into Ghidra and analyse it. Every other Ghidra tool needs this first.
@@ -45,6 +46,11 @@ def open_binary(
     ``job_start('analyze_program', {...})`` and poll ``job_status``, or pass
     ``analyze=True`` anyway accepting the wait. For a large first import,
     ``job_start('open_binary', {...})`` is the non-blocking route.
+
+    ``pdb`` (default False) re-enables the PDB Universal / PDB MSF analyzers, which fetch
+    symbols from the Microsoft symbol server during the first analysis. Off by default
+    because that download can stall on a slow or firewalled machine; a matching PDB next
+    to the binary is picked up regardless.
     """
     downgraded = False
     if path and analyze:
@@ -67,6 +73,7 @@ def open_binary(
                 "loader": loader,
                 "name": name,
                 "reimport": reimport,
+                "pdb": pdb,
             }
         ),
         timeout=timeout,
@@ -129,6 +136,7 @@ def delete_program(program: str) -> str:
 def analyze_program(
     program: str | None = None,
     options: dict[str, Any] | None = None,
+    pdb: bool = False,
     timeout: float = 1800.0,
 ) -> str:
     """Re-run auto-analysis, optionally with different analyser options.
@@ -136,8 +144,10 @@ def analyze_program(
     Reach for this after patching bytes, defining new functions, or fixing a wrong language,
     so the rest of the analysis catches up. See ``analysis_options`` for what can be set.
     Prefer ``job_start`` on anything large.
+
+    ``pdb`` (default False) re-enables the PDB Universal / PDB MSF analyzers for this pass.
     """
-    return ghidra("analyze", clean({"program": program, "options": options}), timeout=timeout)
+    return ghidra("analyze", clean({"program": program, "options": options, "pdb": pdb}), timeout=timeout)
 
 
 @mcp.tool()

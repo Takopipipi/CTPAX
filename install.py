@@ -36,6 +36,11 @@ SOURCE_ROOT = HERE / "src"
 PACKAGE = "ghidra_mcp"
 MCP_SERVER_NAME = "ghidra"
 
+# Every child process speaks UTF-8: on a cp1251/cp1252 machine the console code page
+# otherwise breaks pip/winget output decoding (and progress bars).
+os.environ.setdefault("PYTHONUTF8", "1")
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+
 MIN_PYTHON = (3, 10)
 MIN_JAVA = 21
 
@@ -546,6 +551,59 @@ def build_venv(home: Path, *, recreate: bool) -> Path:
     return python
 
 
+def _vcruntime_ok() -> bool:
+    """Is the MSVC runtime loadable? jpype's _jpype.pyd links against it."""
+    import ctypes
+
+    try:
+        ctypes.WinDLL("vcruntime140.dll")
+        return True
+    except OSError:
+        return False
+
+
+def ensure_vcredist() -> bool:
+    """Install the VC++ x64 redistributable that jpype needs on a clean Windows.
+
+    Without it the import failure reads ``No module named '_jpype'`` - misleading, the
+    module is there and the runtime it links against is not. winget first, then the
+    official aka.ms bootstrapper.
+    """
+    if _vcruntime_ok():
+        return True
+    out.warn("Microsoft Visual C++ runtime (vcruntime140.dll) is missing - jpype cannot load")
+    winget = shutil.which("winget")
+    if winget:
+        try:
+            subprocess.run(
+                [winget, "install", "--id", "Microsoft.VCRedist.2015+.x64", "--silent",
+                 "--accept-package-agreements", "--accept-source-agreements"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=1200, stdin=subprocess.DEVNULL,
+            )
+        except Exception as exc:
+            out.warn(f"winget could not install the VC++ runtime ({exc})")
+        if _vcruntime_ok():
+            out.ok("VC++ runtime installed (winget)")
+            return True
+    try:
+        installer = prereq_dir() / "_vc_redist.x64.exe"
+        download_file("https://aka.ms/vs/17/release/vc_redist.x64.exe", installer, "VC++ runtime")
+        subprocess.run(
+            [str(installer), "/install", "/quiet", "/norestart"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=1800, stdin=subprocess.DEVNULL,
+        )
+        installer.unlink(missing_ok=True)
+        if _vcruntime_ok():
+            out.ok("VC++ runtime installed (aka.ms bootstrapper)")
+            return True
+    except Exception as exc:
+        out.warn(f"the VC++ bootstrapper failed ({exc})")
+    out.warn("install it manually and re-run: https://aka.ms/vs/17/release/vc_redist.x64.exe")
+    return False
+
+
 def pip(python: Path, arguments: list[str], *, label: str) -> None:
     command = [str(python), "-m", "pip", "install", "--disable-pip-version-check", *arguments]
     if os.environ.get("CTPAX_INSECURE_TLS"):
@@ -595,7 +653,27 @@ def install_dependencies(python: Path, *, offline: bool) -> None:
         errors="replace",
     )
     if check.returncode != 0:
-        die(f"the installed environment is not importable:\n      {(check.stderr or '').strip()[:600]}")
+        detail = (check.stderr or "").strip()
+        if "_jpype" in detail or "vcruntime" in detail.lower() or "DLL load failed" in detail:
+            # the classic clean-Windows failure: install the runtime and retry once
+            if ensure_vcredist():
+                check = subprocess.run(
+                    [
+                        str(python),
+                        "-c",
+                        "import mcp, jpype, pyghidra, capstone, lief, pefile, elftools, yara, Crypto;"
+                        "print(jpype.__version__)",
+                    ],
+                    capture_output=True, text=True, encoding="utf-8", errors="replace",
+                )
+                detail = (check.stderr or "").strip()
+        if check.returncode != 0:
+            die(
+                "the installed environment is not importable:\n      "
+                + detail[:600]
+                + "\n      (a missing Microsoft Visual C++ runtime is the usual cause: "
+                  "https://aka.ms/vs/17/release/vc_redist.x64.exe)"
+            )
     out.ok(f"all dependencies import cleanly (JPype {(check.stdout or '').strip()})")
 
 
@@ -630,7 +708,8 @@ def copy_sources(home: Path) -> Path:
     return destination
 
 
-def write_config(home: Path, ghidra_dir: Path, java_home: Path, heap: str) -> Path:
+def write_config(home: Path, ghidra_dir: Path, java_home: Path, heap: str,
+                 x64dbg_dir: Path | None = None) -> Path:
     out.step("Writing config.json")
     path = home / "config.json"
     existing: dict = {}
@@ -647,9 +726,14 @@ def write_config(home: Path, ghidra_dir: Path, java_home: Path, heap: str) -> Pa
             "log_dir": str(home / "logs"),
             "jvm_max_heap": heap,
             "installed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            "installer_version": 1,
+            "installer_version": 2,
         }
     )
+    if x64dbg_dir is not None:
+        # the server reads this: an installer-provided x64dbg is then found without
+        # X64DBG_DIR being set in the environment
+        existing["x64dbg_dir"] = str(x64dbg_dir)
+        existing.setdefault("symbol_path", r"srv*C:\symbols*https://msdl.microsoft.com/download/symbols")
     existing.setdefault("allow_write", True)
     existing.setdefault("max_output_chars", 60000)
     path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
@@ -928,6 +1012,7 @@ def register_with_opencode(
     home: Path,
     ghidra_dir: Path,
     java_home: Path,
+    extra_env: dict[str, str] | None = None,
 ) -> None:
     out.step(f"Registering the MCP server in {config_path.name}")
 
@@ -935,13 +1020,15 @@ def register_with_opencode(
         "type": "local",
         "command": [str(python), "-m", "ghidra_mcp.server"],
         "enabled": True,
-        "timeout": 120000,
+        "timeout": 600000,  # cold-JVM analysis of a big binary exceeds the 120s default
         "environment": {
             "PYTHONPATH": str(source_root),
             "GHIDRA_INSTALL_DIR": str(ghidra_dir),
             "JAVA_HOME": str(java_home),
             "GHIDRA_MCP_HOME": str(home),
             "PYTHONIOENCODING": "utf-8",
+            **(extra_env or {}),
+            "PYTHONUTF8": "1",  # last so nothing can unset it on cp125x VMs
         },
     }
 
@@ -1014,7 +1101,7 @@ def register_with_opencode(
         out.info(f"other MCP servers left untouched: {', '.join(others)}")
 
 
-def _cursor_entry(python: Path, source_root: Path, home: Path, ghidra_dir: Path, java_home: Path) -> dict:
+def _cursor_entry(python: Path, source_root: Path, home: Path, ghidra_dir: Path, java_home: Path, extra_env: dict[str, str] | None = None) -> dict:
     """Build the Cursor-flavoured server entry.
 
     Cursor's schema splits the executable from its arguments: ``command`` is a single
@@ -1031,6 +1118,8 @@ def _cursor_entry(python: Path, source_root: Path, home: Path, ghidra_dir: Path,
             "JAVA_HOME": str(java_home),
             "GHIDRA_MCP_HOME": str(home),
             "PYTHONIOENCODING": "utf-8",
+            "PYTHONUTF8": "1",
+            **(extra_env or {}),
         },
     }
 
@@ -1042,6 +1131,7 @@ def register_with_cursor(
     home: Path,
     ghidra_dir: Path,
     java_home: Path,
+    extra_env: dict[str, str] | None = None,
 ) -> None:
     """Add ``mcpServers.ghidra`` to the global Cursor MCP config, preserving existing servers.
 
@@ -1050,7 +1140,7 @@ def register_with_cursor(
     existing one and leaving unrelated servers untouched is the only sensible behaviour.
     """
     out.step(f"Registering the MCP server in {config_path}")
-    entry = _cursor_entry(python, source_root, home, ghidra_dir, java_home)
+    entry = _cursor_entry(python, source_root, home, ghidra_dir, java_home, extra_env)
     config_path = Path(config_path)
 
     config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1240,7 +1330,7 @@ def claude_config_path() -> Path:
     return Path(os.environ.get("USERPROFILE", str(Path.home()))) / ".claude.json"
 
 
-def _claude_entry(python: Path, source_root: Path, home: Path, ghidra_dir: Path, java_home: Path) -> dict:
+def _claude_entry(python: Path, source_root: Path, home: Path, ghidra_dir: Path, java_home: Path, extra_env: dict[str, str] | None = None) -> dict:
     # Claude Code user-scope servers: ~/.claude.json -> {"mcpServers": {name: {...}}}
     return {
         "type": "stdio",
@@ -1252,12 +1342,14 @@ def _claude_entry(python: Path, source_root: Path, home: Path, ghidra_dir: Path,
             "JAVA_HOME": str(java_home),
             "GHIDRA_MCP_HOME": str(home),
             "PYTHONIOENCODING": "utf-8",
+            "PYTHONUTF8": "1",
+            **(extra_env or {}),
         },
     }
 
 
 def register_with_claude_code(python: Path, source_root: Path, home: Path,
-                              ghidra_dir: Path, java_home: Path, config_path: Path | None = None) -> bool:
+                              ghidra_dir: Path, java_home: Path, config_path: Path | None = None, extra_env: dict[str, str] | None = None) -> bool:
     """Add mcpServers.ghidra to ~/.claude.json, preserving everything else."""
     out.step("Registering the MCP server in Claude Code")
     path = config_path or claude_config_path()
@@ -1278,7 +1370,7 @@ def register_with_claude_code(python: Path, source_root: Path, home: Path,
     if not isinstance(servers, dict):
         servers = {}
         data["mcpServers"] = servers
-    servers[MCP_SERVER_NAME] = _claude_entry(python, source_root, home, ghidra_dir, java_home)
+    servers[MCP_SERVER_NAME] = _claude_entry(python, source_root, home, ghidra_dir, java_home, extra_env)
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     out.ok(f"mcpServers.{MCP_SERVER_NAME} in {path}")
     return True
@@ -1310,13 +1402,15 @@ def _toml_string(value: str) -> str:
     return json.dumps(value)
 
 
-def _codex_block(python: Path, source_root: Path, home: Path, ghidra_dir: Path, java_home: Path) -> str:
+def _codex_block(python: Path, source_root: Path, home: Path, ghidra_dir: Path, java_home: Path, extra_env: dict[str, str] | None = None) -> str:
     env = {
         "PYTHONPATH": str(source_root),
         "GHIDRA_INSTALL_DIR": str(ghidra_dir),
         "JAVA_HOME": str(java_home),
         "GHIDRA_MCP_HOME": str(home),
         "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1",
+        **(extra_env or {}),
     }
     args = ", ".join(_toml_string(a) for a in ["-m", "ghidra_mcp.server"])
     lines = [
@@ -1330,7 +1424,7 @@ def _codex_block(python: Path, source_root: Path, home: Path, ghidra_dir: Path, 
 
 
 def register_with_codex(python: Path, source_root: Path, home: Path,
-                        ghidra_dir: Path, java_home: Path, config_path: Path | None = None) -> bool:
+                        ghidra_dir: Path, java_home: Path, config_path: Path | None = None, extra_env: dict[str, str] | None = None) -> bool:
     """Write the [mcp_servers.ghidra] block into ~/.codex/config.toml, keeping the rest.
 
     Codex config is TOML; the project keeps no TOML writer, so the block is
@@ -1343,7 +1437,7 @@ def register_with_codex(python: Path, source_root: Path, home: Path,
     if original.strip():
         backup = path.with_name(f"{path.name}.backup-{time.strftime('%Y%m%d-%H%M%S')}")
         backup.write_text(original, encoding="utf-8")
-    block = _codex_block(python, source_root, home, ghidra_dir, java_home)
+    block = _codex_block(python, source_root, home, ghidra_dir, java_home, extra_env)
     header = f"[mcp_servers.{MCP_SERVER_NAME}]"
     lines = original.splitlines()
     try:
@@ -1454,6 +1548,8 @@ asyncio.run(main())
             "JAVA_HOME": str(java_home),
             "GHIDRA_MCP_HOME": str(home),
             "PYTHONIOENCODING": "utf-8",
+            "PYTHONUTF8": "1",
+            **(extra_env or {}),
         }
     )
     result = subprocess.run(
@@ -1689,22 +1785,64 @@ def install_nuclei(offline: bool = False) -> bool:
     # templates: ~13k YAML files, needed before scanning; skip in offline mode
     if offline or not marker.is_file():
         return True
-    templates_marker = Path(os.environ.get("USERPROFILE", "")) / "nuclei-templates"
+    templates_marker = Path(os.environ.get("NUCLEI_TEMPLATES_DIR") or (Path(os.environ.get("USERPROFILE", "")) / "nuclei-templates"))
     if templates_marker.is_dir() and any(templates_marker.rglob("*.yaml")):
         out.ok(f"templates already present: {templates_marker}")
         return True
+
+    out.info("fetching the nuclei-templates repo (~250MB, may take a minute)")
     try:
-        out.info("cloning the nuclei-templates repo (~250MB, may take a minute)")
         subprocess.run(
             [str(marker), "-update-templates", "-duc", "-no-color", "-silent"],
-            capture_output=True, timeout=900,
+            capture_output=True, timeout=900, stdin=subprocess.DEVNULL,
         )
-        count = sum(1 for _ in templates_marker.rglob("*.yaml"))
+    except Exception as exc:
+        out.warn(f"nuclei could not update its templates ({exc}); trying the GitHub tarball")
+    count = sum(1 for _ in templates_marker.rglob("*.yaml")) if templates_marker.is_dir() else 0
+    if count:
         out.ok(f"{count} templates in {templates_marker}")
         return True
+
+    # no git on the machine, or nuclei's updater refused: fetch the archive directly
+    if not _install_templates_from_tarball(templates_marker):
+        out.warn("templates are NOT installed - nuclei_scan will run with the built-in checks only")
+        out.info("fix later with: nuclei_templates_update (tool) or by hand:")
+        out.info("  https://github.com/projectdiscovery/nuclei-templates/archive/refs/heads/main.zip")
+        return False
+    count = sum(1 for _ in templates_marker.rglob("*.yaml"))
+    out.ok(f"{count} templates in {templates_marker} (GitHub archive)")
+    return True
+
+
+def _install_templates_from_tarball(destination: Path) -> bool:
+    """Download the templates archive and unpack it (works without git)."""
+    import zipfile
+
+    try:
+        url = "https://github.com/projectdiscovery/nuclei-templates/archive/refs/heads/main.zip"
+        archive = destination.parent / "_nuclei_templates.zip"
+        out.info("downloading the templates archive from GitHub")
+        download_file(url, archive, "nuclei-templates", timeout=1800)
+        staging = destination.parent / "_nuclei_templates_unpack"
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+        with zipfile.ZipFile(archive) as bundle:
+            bundle.extractall(staging)
+        roots = [entry for entry in staging.iterdir() if entry.is_dir()]
+        source = roots[0] if len(roots) == 1 else staging
+        destination.mkdir(parents=True, exist_ok=True)
+        for entry in source.iterdir():
+            target = destination / entry.name
+            if entry.is_dir():
+                shutil.copytree(entry, target, dirs_exist_ok=True)
+            else:
+                shutil.copy2(entry, target)
+        shutil.rmtree(staging, ignore_errors=True)
+        archive.unlink(missing_ok=True)
+        return any(destination.rglob("*.yaml"))
     except Exception as exc:
-        out.warn(f"template clone failed ({exc}); run: {marker} -update-templates")
-        return True
+        out.warn(f"the templates archive could not be unpacked ({exc})")
+        return False
 
 
 PROGRESS: "Callable[[str, float], None] | None" = None
@@ -1743,11 +1881,17 @@ def do_install(arguments: argparse.Namespace) -> int:
 
     python = build_venv(home, recreate=arguments.recreate_venv)
     _tick("virtualenv ready", 0.18)
+    ensure_vcredist()  # jpype's _jpype.pyd needs vcruntime140.dll
     install_dependencies(python, offline=arguments.offline)
     _tick("python dependencies installed", 0.45)
     source_root = copy_sources(home)
     _tick("sources copied", 0.5)
-    write_config(home, ghidra_dir, java_home, arguments.heap)
+    # locate (or unpack) x64dbg first: config.json and the client env both record it,
+    # otherwise the server cannot find the debugger the installer just laid down
+    x64dbg_root = find_x64dbg_root()
+    if x64dbg_root is not None:
+        out.ok(f"x64dbg: {x64dbg_root}")
+    write_config(home, ghidra_dir, java_home, arguments.heap, x64dbg_dir=x64dbg_root)
     _tick("config written", 0.54)
     install_x64dbg_plugin()
     _tick("x64dbg plugin step done", 0.6)
@@ -1794,26 +1938,29 @@ def do_install(arguments: argparse.Namespace) -> int:
     if arguments.all_clients:
         _tick(f"clients detected: {', '.join(n for n, yes in clients.items() if yes) or 'opencode only'}", 0.86)
 
+    client_env: dict[str, str] = {}
+    if x64dbg_root is not None:
+        client_env['X64DBG_DIR'] = str(x64dbg_root)
     config_path = opencode_config_path(arguments.opencode_config)
-    register_with_opencode(config_path, python, source_root, home, ghidra_dir, java_home)
+    register_with_opencode(config_path, python, source_root, home, ghidra_dir, java_home, client_env)
     _tick("opencode registered", 0.9)
 
     if register_flags["cursor"]:
         if clients["cursor"]:
             cursor_path = cursor_config_path(arguments.cursor_config)
-            register_with_cursor(cursor_path, python, source_root, home, ghidra_dir, java_home)
+            register_with_cursor(cursor_path, python, source_root, home, ghidra_dir, java_home, client_env)
         else:
             out.warn("no Cursor install detected; skipping Cursor registration")
     _tick("cursor step done", 0.93)
 
     if register_flags["claude"]:
         if clients["claude"]:
-            register_with_claude_code(python, source_root, home, ghidra_dir, java_home)
+            register_with_claude_code(python, source_root, home, ghidra_dir, java_home, extra_env=client_env)
         else:
             out.warn("no Claude Code detected; skipping registration")
     if register_flags["codex"]:
         if clients["codex"]:
-            register_with_codex(python, source_root, home, ghidra_dir, java_home)
+            register_with_codex(python, source_root, home, ghidra_dir, java_home, extra_env=client_env)
         else:
             out.warn("no Codex detected; skipping registration")
     _tick("registrations done", 0.98)

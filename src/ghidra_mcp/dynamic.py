@@ -255,9 +255,27 @@ def find_cdb() -> dict[str, Any]:
 
 
 def find_x64dbg() -> dict[str, Any]:
-    """Locate x64dbg from X64DBG_DIR or the usual unpack locations."""
+    """Locate x64dbg: X64DBG_DIR, HKCU/HKLM uninstall keys, the CTPAX home, usual paths.
+
+    The CTPAX installer unpacks x64dbg into ``<CTPAX>\\x64dbg\\release`` next to the
+    server home and records ``x64dbg_dir`` in config.json - both are searched here, so
+    an installer-provided debugger is found without touching the environment.
+    """
+    from ghidra_mcp.runtime import SETTINGS
+
+    roots: list[str] = []
     override = os.environ.get("X64DBG_DIR")
-    roots = ([override] if override else []) + _X64DBG_ROOTS
+    if override:
+        roots.append(override)
+    configured = getattr(SETTINGS, "x64dbg_dir", None)
+    if configured:
+        roots.append(str(configured))
+    try:
+        home = Path(getattr(SETTINGS, "home"))
+        roots += [str(home.parent / "x64dbg" / "release"), str(home / "x64dbg" / "release")]
+    except Exception:
+        pass
+    roots += list(_X64DBG_ROOTS)
     for root_text in roots:
         root = Path(root_text)
         if not root.is_dir():
@@ -265,10 +283,11 @@ def find_x64dbg() -> dict[str, Any]:
         for name in ("x96dbg.exe", "x64dbg.exe", "x32dbg.exe"):
             candidate = root / name
             if candidate.is_file():
-                return {"found": True, "launcher": str(candidate), "root": str(root)}
+                return {"found": True, "launcher": str(candidate), "root": str(root), "source": root_text}
     return {
         "found": False,
-        "hint": "unpack x64dbg (https://x64dbg.com) and set X64DBG_DIR to its release folder, or unpack it to C:\\x64dbg",
+        "searched": roots[:8],
+        "hint": "run CTPAX-Setup.exe (it unpacks x64dbg into <CTPAX>\\x64dbg) or set X64DBG_DIR to the release folder",
     }
 
 

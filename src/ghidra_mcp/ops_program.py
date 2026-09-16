@@ -186,12 +186,34 @@ def open_binary(session: Session, params: dict[str, Any], progress: Callable[...
     if analyze and needs_analysis:
         progress(stage="analyze", note="auto-analysis running, this is the slow part")
         started = time.time()
-        with session.transaction(entry, "MCP auto-analysis"):
-            log = session.pyghidra.analyze(entry.program, session.monitor())
+        analyzed = False
+        if not params.get("pdb"):
+            # PE symbol fetching (PDB Universal / PDB MSF analyzers) can stall the very
+            # first analysis on a cold worker by downloading from the symbol server.
+            # Default: fast local analysis; opt back in with pdb=true.
+            try:
+                from ghidra.app.plugin.core.analysis import AutoAnalysisManager  # type: ignore
+
+                with session.transaction(entry, "MCP auto-analysis"):
+                    manager = AutoAnalysisManager.getAnalysisManager(entry.program)
+                    manager.initializeOptions(
+                        session.monitor(),
+                        {"PDB Universal": False, "PDB MSF": False},
+                    )
+                    manager.startAnalysis(session.monitor())
+                analyzed = True
+            except Exception as exc:  # fall back to default analysis if options fight back
+                progress(stage="analyze", note=f"manager route failed ({exc}); falling back")
+        if not analyzed:
+            with session.transaction(entry, "MCP auto-analysis"):
+                log = session.pyghidra.analyze(entry.program, session.monitor())
         session.check_cancel()
         session.save(entry)
         result["analysis_seconds"] = round(time.time() - started, 2)
-        result["analysis_log_tail"] = str(log or "")[-1500:]
+        if analyzed:
+            result["analysis_log_tail"] = "auto-analysis via AutoAnalysisManager (PDB analyzers off; set pdb=true to enable)"
+        else:
+            result["analysis_log_tail"] = str(log or "")[-1500:]
     else:
         result["analysis_seconds"] = 0.0
         result["already_analyzed"] = not needs_analysis
@@ -223,8 +245,27 @@ def analyze(session: Session, params: dict[str, Any], progress: Callable[..., No
     before = int(entry.program.getFunctionManager().getFunctionCount())
     started = time.time()
     progress(stage="analyze", functions_before=before)
-    with session.transaction(entry, "MCP re-analysis"):
-        log = session.pyghidra.analyze(entry.program, session.monitor())
+    analyzed = False
+    pdb_requested = bool(params.get("pdb")) or any(
+        name.startswith("PDB") for name in options
+    )
+    if not pdb_requested:
+        try:
+            from ghidra.app.plugin.core.analysis import AutoAnalysisManager  # type: ignore
+
+            with session.transaction(entry, "MCP re-analysis"):
+                manager = AutoAnalysisManager.getAnalysisManager(entry.program)
+                manager.initializeOptions(
+                    session.monitor(),
+                    {"PDB Universal": False, "PDB MSF": False},
+                )
+                manager.startAnalysis(session.monitor())
+            analyzed = True
+        except Exception as exc:
+            progress(stage="analyze", note=f"manager route failed ({exc}); falling back")
+    if not analyzed:
+        with session.transaction(entry, "MCP re-analysis"):
+            log = session.pyghidra.analyze(entry.program, session.monitor())
     session.check_cancel()
     session.save(entry)
     after = int(entry.program.getFunctionManager().getFunctionCount())
@@ -234,7 +275,8 @@ def analyze(session: Session, params: dict[str, Any], progress: Callable[..., No
         "functions_before": before,
         "functions_after": after,
         "options_applied": changed_options,
-        "log_tail": str(log or "")[-4000:],
+        "pdb_analyzers_disabled": analyzed,
+        "log_tail": str(log or "")[-4000:] if not analyzed else "auto-analysis via AutoAnalysisManager (PDB analyzers off; set pdb=true to enable)",
     }
 
 

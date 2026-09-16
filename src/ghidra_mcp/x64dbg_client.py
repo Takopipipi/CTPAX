@@ -59,7 +59,26 @@ class X64DbgSession:
         with self._lock:
             self.stop_if_any()
             client = X64DbgClient(x64dbg_path=self._debugger_path())
-            session_pid = client.start_session(target_exe=target or "", cmdline=cmdline, current_dir=current_dir)
+            # The automate plugin occasionally loses the very first load of a session
+            # (it reports "Failed to load executable" once, then works) - retry with a
+            # short pause and keep the plugin's own message if every attempt fails.
+            last_error: Exception | None = None
+            session_pid = None
+            for attempt in range(3):
+                try:
+                    session_pid = client.start_session(target_exe=target or "", cmdline=cmdline, current_dir=current_dir)
+                    last_error = None
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    message = str(exc).lower()
+                    if "load" not in message and "executable" not in message:
+                        raise
+                    time.sleep(1.5)
+            if last_error is not None:
+                raise RuntimeError(
+                    f"x64dbg could not load the target after 3 attempts: {last_error}"
+                ) from last_error
             self.client = client
             self.target = target
             self.started_at = time.time()

@@ -476,6 +476,43 @@ class TestCTPAX(unittest.TestCase):
                     offenders.append(node.lineno)
         self.assertEqual(offenders, [], f"subprocess.run(text=True) without encoding at lines {offenders}")
 
+    def test_registration_entries_carry_env_and_timeout(self):
+        """Every generated client entry must set PYTHONUTF8 and pass extra_env through,
+        so the server survives cp125x VMs and knows X64DBG_DIR from installation."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            python = Path("C:\\py\\python.exe")
+            source = Path("C:\\src")
+            home = Path(tmp) / "home"
+            ghidra = Path("E:\\gh")
+            java = Path("E:\\java")
+            env = {"X64DBG_DIR": "E:\\x64dbg\\release"}
+
+            opencode_path = Path(tmp) / "opencode.jsonc"
+            cursor_path = Path(tmp) / "cursor.json"
+            claude_path = Path(tmp) / "claude.json"
+            codex_path = Path(tmp) / "codex.toml"
+            self.engine.register_with_opencode(opencode_path, python, source, home, ghidra, java, env)
+            self.engine.register_with_cursor(cursor_path, python, source, home, ghidra, java, env)
+            self.engine.register_with_claude_code(
+                python, source, home, ghidra, java, config_path=claude_path, extra_env=env
+            )
+            self.engine.register_with_codex(
+                python, source, home, ghidra, java, config_path=codex_path, extra_env=env
+            )
+
+            artifacts = [
+                opencode_path.read_text(encoding="utf-8"),
+                cursor_path.read_text(encoding="utf-8"),
+                claude_path.read_text(encoding="utf-8"),
+                codex_path.read_text(encoding="utf-8"),
+            ]
+            for artifact in artifacts:
+                self.assertIn("PYTHONUTF8", artifact, "every entry needs PYTHONUTF8")
+                self.assertIn("E:\\\\x64dbg\\\\release", artifact)
+                self.assertIn("PYTHONIOENCODING", artifact)
+
     def test_claude_registration_roundtrip(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / ".claude.json"
@@ -523,19 +560,25 @@ class TestVersion(unittest.TestCase):
     def test_outdated_with_patched_check(self):
         from ghidra_mcp import version
 
-        saved, version._INMEMORY = version._INMEMORY, None
+        saved_inmemory, version._INMEMORY = version._INMEMORY, None
+        saved_version = version.__version__
         try:
-            # stale_notice reads the cache (never the network): feed it directly
-            version._INMEMORY = {"installed": "1.0.0", "latest": "1.0.1", "checked_at": time.time()}
+            # stale_notice reads the cache (never the network): feed it directly.
+            # The comparison uses the RUNNING __version__, so lower ours to simulate
+            # an old build; the cache's "installed" field must NOT matter.
+            version.__version__ = "1.0.0"
+            version._INMEMORY = {"installed": "9.9.9", "latest": "1.0.1", "checked_at": time.time()}
             notice = version.stale_notice()
             self.assertIn("CTPAX-MCP-OUTDATED", notice)
             self.assertIn("version_update", notice)
             self.assertIn("restart", notice)
 
-            version._INMEMORY = {"installed": "1.0.1", "latest": "1.0.1", "checked_at": time.time()}
+            version._INMEMORY = {"installed": "9.9.9", "latest": "1.0.1", "checked_at": time.time()}
+            version.__version__ = "1.0.1"
             self.assertEqual(version.stale_notice(), "")
 
             # outdated() still consults check() (the network-capable path)
+            version.__version__ = "1.0.0"
             saved_check = version.check
             version.check = lambda force=False: {"installed": "1.0.0", "latest": "1.0.1", "checked_at": time.time()}
             fact = version.outdated()
@@ -544,7 +587,8 @@ class TestVersion(unittest.TestCase):
             version.check = lambda force=False: {"installed": "1.0.0", "latest": None, "error": "offline"}
             self.assertIsNone(version.outdated())
         finally:
-            version._INMEMORY = saved
+            version._INMEMORY = saved_inmemory
+            version.__version__ = saved_version
 
     def test_cache_roundtrip(self):
         from ghidra_mcp import version

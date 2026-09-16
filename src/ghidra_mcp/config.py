@@ -284,12 +284,15 @@ class Settings:
     # WinDbg symbol path for cdb runs and sessions; override for offline machines
     # (SYM* paths, a local symbol cache) or a different symbol cache location.
     symbol_path: str = r"srv*C:\symbols*https://msdl.microsoft.com/download/symbols"
+    # Where x64dbg lives (the installer records the copy it unpacked under <CTPAX>).
+    x64dbg_dir: Path | None = None
 
     def __post_init__(self) -> None:
         self.home = Path(self.home)
         self.project_dir = Path(self.project_dir) if self.project_dir else self.home / "projects"
         self.log_dir = Path(self.log_dir) if self.log_dir else self.home / "logs"
         self.notes_file = Path(self.notes_file) if self.notes_file else self.home / "notes.json"
+        self.x64dbg_dir = Path(self.x64dbg_dir) if self.x64dbg_dir else None
 
     @classmethod
     def load(cls) -> "Settings":
@@ -303,12 +306,14 @@ class Settings:
 
         ghidra = pick("ghidra_dir", "GHIDRA_INSTALL_DIR")
         java = pick("java_home", "JAVA_HOME")
+        x64dbg = pick("x64dbg_dir", "X64DBG_DIR")
         settings = cls(
             home=home,
             ghidra_dir=Path(ghidra) if ghidra else None,
             java_home=java_home_of(Path(java)) if java else None,
             project_dir=Path(data["project_dir"]) if data.get("project_dir") else None,
             log_dir=Path(data["log_dir"]) if data.get("log_dir") else None,
+            x64dbg_dir=Path(x64dbg) if x64dbg else None,
         )
         for key in (
             "max_output_chars",
