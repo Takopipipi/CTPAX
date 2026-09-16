@@ -415,6 +415,17 @@ class TestCTPAX(unittest.TestCase):
         self.assertGreaterEqual(drives[0]["free_gb"], drives[-1]["free_gb"])
         self.assertTrue(any(d["free_gb"] >= 1 for d in drives))
 
+    def test_banner_art(self):
+        import ctpax_setup
+
+        art = ctpax_setup.build_banner("CTPAX")
+        rows = art.splitlines()
+        self.assertEqual(len(rows), 6)
+        self.assertTrue(all(len(row) == len(rows[0]) for row in rows), "rows must align")
+        # the shapes that were misread as "СТОАК" must be distinct letters
+        for glyph in ("C", "T", "P", "A", "X"):
+            self.assertIn(glyph, ctpax_setup._GLYPH_ROWS)
+
     def test_claude_registration_roundtrip(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / ".claude.json"
@@ -463,22 +474,26 @@ class TestVersion(unittest.TestCase):
         from ghidra_mcp import version
 
         saved, version._INMEMORY = version._INMEMORY, None
-        saved_check = version.check
         try:
+            # stale_notice reads the cache (never the network): feed it directly
+            version._INMEMORY = {"installed": "1.0.0", "latest": "1.0.1", "checked_at": time.time()}
+            notice = version.stale_notice()
+            self.assertIn("CTPAX-MCP-OUTDATED", notice)
+            self.assertIn("version_update", notice)
+            self.assertIn("restart", notice)
+
+            version._INMEMORY = {"installed": "1.0.1", "latest": "1.0.1", "checked_at": time.time()}
+            self.assertEqual(version.stale_notice(), "")
+
+            # outdated() still consults check() (the network-capable path)
+            saved_check = version.check
             version.check = lambda force=False: {"installed": "1.0.0", "latest": "1.0.1", "checked_at": time.time()}
             fact = version.outdated()
             self.assertIsNotNone(fact)
             self.assertEqual(fact["latest"], "1.0.1")
-            notice = version.stale_notice()
-            self.assertIn("CTPAX-MCP-OUTDATED", notice)
-            self.assertIn("version_update", notice)
-            version.check = lambda force=False: {"installed": "1.0.1", "latest": "1.0.1", "checked_at": time.time()}
-            self.assertIsNone(version.outdated())
-            self.assertEqual(version.stale_notice(), "")
             version.check = lambda force=False: {"installed": "1.0.0", "latest": None, "error": "offline"}
             self.assertIsNone(version.outdated())
         finally:
-            version.check = saved_check
             version._INMEMORY = saved
 
     def test_cache_roundtrip(self):

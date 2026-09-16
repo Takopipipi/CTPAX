@@ -27,14 +27,29 @@ IS_WINDOWS = os.name == "nt"
 
 SMALL_BANNER = "revers mcp server by teto"
 
-CTPAX_ART = r"""
- ██████╗████████╗ ██████╗  █████╗ ██╗  ██╗
-██╔════╝╚══██╔══╝██╔═══██╗██╔══██╗██║ ██╔╝
-██║        ██║   ██║   ██║███████║█████╔╝
-██║        ██║   ██║   ██║██╔══██║██╔═██╗
-╚██████╗   ██║   ╚██████╔╝██║  ██║██║  ██╗
- ╚═════╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝
-"""
+# Big block letters spelling CTPAX in unambiguous shapes (reads as the word, not as
+# squashed "СТОАК" - each glyph is a 6-row dot-matrix letter).
+_GLYPH_ROWS = {
+    "C": [" ██████ ", "██      ", "██      ", "██      ", "██      ", " ██████ "],
+    "T": ["████████", "   ██   ", "   ██   ", "   ██   ", "   ██   ", "   ██   "],
+    "P": ["██████  ", "██   ██ ", "██████  ", "██      ", "██      ", "██      "],
+    "A": ["  ████  ", " ██  ██ ", "████████", "██    ██", "██    ██", "██    ██"],
+    "X": ["██    ██", " ██  ██ ", "  ████  ", "  ████  ", " ██  ██ ", "██    ██"],
+}
+
+
+def build_banner(word: str = "CTPAX") -> str:
+    rows = ["" for _ in range(6)]
+    for letter in word:
+        glyph = _GLYPH_ROWS.get(letter.upper())
+        if glyph is None:
+            continue
+        for index in range(6):
+            rows[index] += ("   " if rows[index] else "") + glyph[index]
+    return "\n".join(rows)
+
+
+CTPAX_ART = "\n" + build_banner() + "\n"
 
 ACCENT = "\x1b[96m"
 DIM = "\x1b[90m"
@@ -162,12 +177,12 @@ class Progress:
 
 
 # --------------------------------------------------------------------------
-# the engine: import install.py next to this file
+# the engine: import install.py from the laid-down copy (never from the exe)
 # --------------------------------------------------------------------------
-def load_engine() -> object:
-    script = Path(__file__).with_name("install.py")
+def load_engine(script: Path) -> object:
+    script = Path(script)
     if not script.is_file():
-        raise FileNotFoundError(f"install.py not found next to {Path(__file__).name}")
+        raise FileNotFoundError(f"installer engine missing: {script}")
     spec = importlib.util.spec_from_file_location("ctpax_install", script)
     module = importlib.util.module_from_spec(spec)
     sys.dont_write_bytecode_backup = getattr(sys, "dont_write_bytecode", False)
@@ -229,9 +244,138 @@ def self_copy_into(target: Path) -> Path:
     return destination
 
 
+# --------------------------------------------------------------------------
+# prerequisites on a clean machine: Ghidra + a JDK 21
+# --------------------------------------------------------------------------
+GHIDRA_API = "https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/latest"
+ADOPTIUM_API = (
+    "https://api.adoptium.net/v3/assets/latest/21/hotspot"
+    "?architecture=x64&image_type=jdk&os=windows&vendor=eclipse"
+)
+
+
+def _download(url: str, destination: Path, label: str) -> None:
+    """Stream a download with a console progress bar (Content-Length when offered)."""
+    import urllib.request
+
+    request = urllib.request.Request(url, headers={"User-Agent": "CTPAX-Setup"})
+    with urllib.request.urlopen(request, timeout=120) as response, open(destination, "wb") as handle:
+        total = int(response.headers.get("Content-Length") or 0)
+        done = 0
+        last = 0.0
+        while True:
+            chunk = response.read(1024 * 256)
+            if not chunk:
+                break
+            handle.write(chunk)
+            done += len(chunk)
+            now = time.time()
+            if now - last > 0.2:
+                last = now
+                if total:
+                    fraction = done / total
+                    sys.stdout.write(f"\r    {label:<28} {mini_bar(fraction, 24)} {done / 1048576:6.1f}/{total / 1048576:.0f} MB")
+                else:
+                    sys.stdout.write(f"\r    {label:<28} {done / 1048576:6.1f} MB")
+                sys.stdout.flush()
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
+def _find_marker(root: Path, marker: str) -> Path | None:
+    if not root.is_dir():
+        return None
+    for candidate in root.rglob(marker):
+        return candidate
+    return None
+
+
+def ensure_ghidra(target_root: Path, *, offline: bool = False) -> Path | None:
+    """A Ghidra install inside CTPAX (downloading it on a clean machine)."""
+    import json
+    import urllib.request
+    import zipfile
+
+    local = target_root / "ghidra"
+    marker = _find_marker(local, "analyzeHeadless.bat")
+    if marker is not None:
+        print(f"    {ok_text('Ghidra found')}: {marker.parent.parent}")
+        return marker.parent.parent
+    if offline:
+        return None
+
+    try:
+        request = urllib.request.Request(GHIDRA_API, headers={"User-Agent": "CTPAX-Setup"})
+        with urllib.request.urlopen(request, timeout=30) as response:
+            release = json.loads(response.read())
+        asset = next(
+            (a for a in release["assets"] if a["name"].lower().endswith(".zip") and "public" in a["name"].lower() and "ghidra_" in a["name"].lower()),
+            None,
+        )
+        if asset is None:
+            print(f"    {YELLOW}no Ghidra zip in the latest release; install it manually{RESET}")
+            return None
+        print(f"    downloading Ghidra {release['tag_name']} (~450MB) ...")
+        archive = target_root / "_ghidra.zip"
+        _download(asset["browser_download_url"], archive, f"Ghidra {release['tag_name']}")
+        local.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(archive) as bundle:
+            bundle.extractall(local)
+        archive.unlink(missing_ok=True)
+        marker = _find_marker(local, "analyzeHeadless.bat")
+        if marker is None:
+            print(f"    {YELLOW}Ghidra archive layout unexpected{RESET}")
+            return None
+        print(f"    {ok_text('Ghidra installed')}: {marker.parent.parent}")
+        return marker.parent.parent
+    except Exception as exc:
+        print(f"    {YELLOW}could not install Ghidra automatically ({exc}){RESET}")
+        return None
+
+
+def ensure_jdk(target_root: Path, *, offline: bool = False) -> Path | None:
+    """A JDK 21 inside CTPAX (Eclipse Temurin, downloading it on a clean machine)."""
+    import json
+    import urllib.request
+    import zipfile
+
+    local = target_root / "jdk"
+    marker = _find_marker(local, "java.exe")
+    if marker is not None:
+        print(f"    {ok_text('JDK found')}: {marker.parent.parent}")
+        return marker.parent.parent
+    if offline:
+        return None
+
+    try:
+        request = urllib.request.Request(ADOPTIUM_API, headers={"User-Agent": "CTPAX-Setup"})
+        with urllib.request.urlopen(request, timeout=30) as response:
+            payload = json.loads(response.read())
+        link = payload[0]["binary"]["package"]["link"]
+        name = payload[0]["binary"]["package"]["name"]
+        print(f"    downloading {name} (~190MB) ...")
+        archive = target_root / "_jdk.zip"
+        _download(link, archive, "JDK 21 (Temurin)")
+        local.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(archive) as bundle:
+            bundle.extractall(local)
+        archive.unlink(missing_ok=True)
+        marker = _find_marker(local, "java.exe")
+        if marker is None:
+            print(f"    {YELLOW}JDK archive layout unexpected{RESET}")
+            return None
+        home = marker.parent.parent
+        print(f"    {ok_text('JDK installed')}: {home}")
+        return home
+    except Exception as exc:
+        print(f"    {YELLOW}could not install a JDK automatically ({exc}){RESET}")
+        return None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="CTPAX installer")
     parser.add_argument("--check", action="store_true", help="show the plan, install nothing")
+    parser.add_argument("--engine-only", action="store_true", help="lay the sources down, load the engine, then stop (self-test)")
     parser.add_argument("--recreate-venv", action="store_true", help="rebuild the virtual environment")
     parser.add_argument("--offline", action="store_true", help="skip all downloads")
     args = parser.parse_args()
@@ -277,26 +421,39 @@ def main() -> int:
         return 0
 
     # --- phase 3: lay the sources down (embedded zip for the exe, file copy for the bat)
-    print(f"\n  {c('1/2')} laying the project into {target_root}\\installer ...", flush=True)
+    print(f"\n  {c('1/3')} checking Ghidra and JDK 21 ...", flush=True)
+    prereq_offline = args.offline or args.engine_only  # the self-test downloads nothing
+    ghidra_home = ensure_ghidra(target_root, offline=prereq_offline)
+    java_home = ensure_jdk(target_root, offline=prereq_offline)
+    if ghidra_home is None or java_home is None:
+        print(f"    {YELLOW}not found locally; the installer will look for them on the system{RESET}")
+
+    print(f"  {c('2/3')} laying the project into {target_root}\\installer ...", flush=True)
     engine_dir = get_installer_dir(target_root)
     print(f"      {ok_text('done')}", flush=True)
 
     # --- phase 4: run the engine with progress ---
-    print(f"  {c('2/2')} installing everything (this is the long part):\n", flush=True)
+    print(f"  {c('3/3')} installing everything (this is the long part):\n", flush=True)
     sys.path.insert(0, str(engine_dir))
     try:
-        engine = load_engine()
+        engine = load_engine(engine_dir / "install.py")
     except Exception as exc:
         print(f"  could not load the installer engine: {exc}", file=sys.stderr)
         traceback.print_exc()
         return 1
     os.chdir(engine_dir)
 
+    if args.engine_only:
+        print(f"  {ok_text('engine loaded')} from {engine_dir} (--engine-only: stopping here)")
+        return 0
+
     bar = Progress()
     engine.PROGRESS = bar.set
     namespace = argparse.Namespace(
         check=False, uninstall=False,
-        home=str(home), ghidra=None, java=None,
+        home=str(home),
+        ghidra=str(ghidra_home) if ghidra_home else None,
+        java=str(java_home) if java_home else None,
         opencode_config=None, cursor=False, cursor_config=None,
         claude=False, codex=False, all_clients=True,
         heap=os.environ.get("CTPAX_HEAP", "4G"),
