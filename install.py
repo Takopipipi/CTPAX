@@ -143,6 +143,34 @@ def prereq_dir() -> Path:
     return Path(os.environ.get("GHIDRA_MCP_HOME") or (Path.home() / ".ghidra_mcp")).parent
 
 
+def ssl_context():
+    """HTTPS context that works from the frozen exe (no CA store of its own).
+
+    Without an explicit bundle every download dies with CERTIFICATE_VERIFY_FAILED; the
+    build ships certifi. CTPAX_INSECURE_TLS=1 (or --insecure-tls) disables verification
+    for TLS-intercepting AV/proxies - unsafe, but better than a dead installer.
+    """
+    import ssl
+
+    if os.environ.get("CTPAX_INSECURE_TLS"):
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        out.warn("TLS verification is DISABLED (CTPAX_INSECURE_TLS)")
+        return context
+    try:
+        import certifi  # type: ignore
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        context = ssl.create_default_context()
+        try:
+            context.load_default_certs()
+        except Exception:
+            pass
+        return context
+
+
 def _human_mb(value: int) -> str:
     return f"{value / 1048576:.0f} MB" if value else "?"
 
@@ -153,7 +181,7 @@ def download_file(url: str, destination: Path, label: str, *, timeout: float = 1
 
     request = urllib.request.Request(url, headers={"User-Agent": "CTPAX-Setup"})
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with urllib.request.urlopen(request, timeout=timeout) as response, open(destination, "wb") as handle:
+    with urllib.request.urlopen(request, timeout=timeout, context=ssl_context()) as response, open(destination, "wb") as handle:
         total = int(response.headers.get("Content-Length") or 0)
         done = 0
         last = 0.0
@@ -189,7 +217,7 @@ def _github_latest(api_url: str) -> dict:
     import urllib.request
 
     request = urllib.request.Request(api_url, headers={"User-Agent": "CTPAX-Setup", "Accept": "application/vnd.github+json"})
-    with urllib.request.urlopen(request, timeout=30) as response:
+    with urllib.request.urlopen(request, timeout=30, context=ssl_context()) as response:
         return json.loads(response.read())
 
 
@@ -227,6 +255,7 @@ def install_ghidra(target_dir: Path) -> Path | None:
         return home
     except Exception as exc:
         out.warn(f"could not install Ghidra automatically ({exc})")
+        out.info("if this is TLS interception (corporate proxy / AV), re-run with --insecure-tls")
         return None
 
 
@@ -519,7 +548,11 @@ def build_venv(home: Path, *, recreate: bool) -> Path:
 
 def pip(python: Path, arguments: list[str], *, label: str) -> None:
     command = [str(python), "-m", "pip", "install", "--disable-pip-version-check", *arguments]
-    result = subprocess.run(command, capture_output=True, text=True)
+    if os.environ.get("CTPAX_INSECURE_TLS"):
+        # pip has its own CA bundle; a TLS-intercepting proxy still needs trusted hosts
+        for host in ("pypi.org", "files.pythonhosted.org", "github.com", "objects.githubusercontent.com"):
+            command += ["--trusted-host", host]
+    result = subprocess.run(command, capture_output=True, text=True, stdin=subprocess.DEVNULL)
     if result.returncode != 0:
         tail = (result.stderr or result.stdout).strip().splitlines()[-12:]
         die(f"{label} failed:\n      " + "\n      ".join(tail))
@@ -1692,6 +1725,8 @@ def do_install(arguments: argparse.Namespace) -> int:
     check_install_path(home)
     NON_INTERACTIVE = bool(getattr(arguments, "yes", False))
     OFFLINE_MODE = bool(arguments.offline)
+    if getattr(arguments, "insecure_tls", False):
+        os.environ["CTPAX_INSECURE_TLS"] = "1"
     INSTALL_ROOT = home.parent  # self-installed Ghidra/JDK/x64dbg live beside the home
     out.info(f"install location: {home}")
     _tick("checking the environment", 0.04)
@@ -1929,6 +1964,7 @@ def main() -> int:
     parser.add_argument("--skip-verify", action="store_true", help="do not start the server to verify")
     parser.add_argument("--force", action="store_true", help="register in OpenCode even if verification fails")
     parser.add_argument("--no-register", action="store_true", help="install only; never touch AI client configs")
+    parser.add_argument("--insecure-tls", action="store_true", help="skip TLS verification (only for intercepting AV/proxies)")
     arguments = parser.parse_args()
 
     try:

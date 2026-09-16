@@ -87,6 +87,8 @@ def _runtime_imports() -> list[str]:
         expanded.add(name.split(".")[0])
     # submodules reached through attribute access (ctypes.wintypes) never show up in AST
     expanded.update({"ctypes.wintypes", "winreg", "urllib.error", "urllib.parse", "http.client", "email.message"})
+    # certifi carries the CA bundle the frozen exe needs for every HTTPS call
+    expanded.add("certifi")
     return sorted(name for name in expanded if name.split(".")[0] != "ghidra_mcp")
 
 
@@ -100,6 +102,7 @@ def build() -> Path:
         "--onefile", "--noconfirm", "--clean",
         "--name", "CTPAX-Setup",
         "--add-data", f"{PAYLOAD}{';' if sys.platform == 'win32' else ':'}.",
+        "--collect-data", "certifi",  # cacert.pem - without it every HTTPS call fails
         *[f"--hidden-import={name}" for name in hidden],
         str(ROOT / "ctpax_setup.py"),
     ]

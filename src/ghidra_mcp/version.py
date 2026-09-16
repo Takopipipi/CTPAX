@@ -22,7 +22,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-__version__ = "1.0.5"
+__version__ = "1.0.6"
 
 REPO = "Takopipipi/CTPAX"
 _RELEASE_API = f"https://api.github.com/repos/{REPO}/releases/latest"
@@ -52,6 +52,34 @@ def _version_tuple(tag: str) -> tuple[int, ...]:
         digits = re.findall(r"\d+", tag)
         return tuple(int(d) for d in digits[:3]) + (0,) * (3 - len(digits[:3]))
     return tuple(int(g) for g in core.groups())
+
+
+def _ssl_context():
+    """A verifying SSL context that works inside a frozen (PyInstaller) build.
+
+    The bundled exe has no CA store of its own: without an explicit bundle every HTTPS
+    call dies with CERTIFICATE_VERIFY_FAILED. certifi ships with the build; the Windows
+    store is the fallback. CTPAX_INSECURE_TLS=1 disables verification as a last resort
+    (TLS-intercepting AV/proxies).
+    """
+    import ssl
+
+    if os.environ.get("CTPAX_INSECURE_TLS"):
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        return context
+    try:
+        import certifi  # type: ignore
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        context = ssl.create_default_context()
+        try:
+            context.load_default_certs()
+        except Exception:
+            pass
+        return context
 
 
 def _tag_from_redirect(timeout: float = 8.0) -> str | None:
@@ -84,7 +112,7 @@ def _fetch_latest(timeout: float = 8.0) -> tuple[str | None, bool]:
     which is "up to date", not a failure; a quota error falls back to the redirect."""
     request = urllib.request.Request(_RELEASE_API, headers={"User-Agent": "CTPAX-MCP", "Accept": "application/vnd.github+json"})
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with urllib.request.urlopen(request, timeout=timeout, context=_ssl_context()) as response:
             data = json.loads(response.read().decode("utf-8", "replace"))
         tag = (data.get("tag_name") or data.get("name") or "").strip()
         return (tag or None, False)

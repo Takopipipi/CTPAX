@@ -282,11 +282,15 @@ def main() -> int:
     parser.add_argument("--selftest", action="store_true", help="check that the frozen build can import everything the engine needs")
     parser.add_argument("--home", help="CTPAX root override (default: biggest fixed drive, <drive>:\\CTPAX)")
     parser.add_argument("--no-register", action="store_true", help="install only; do not touch any AI client config (for sandbox tests)")
+    parser.add_argument("--insecure-tls", action="store_true", help="skip TLS verification when downloading (only for intercepting AV/proxies)")
     parser.add_argument("--recreate-venv", action="store_true", help="rebuild the virtual environment")
     parser.add_argument("--offline", action="store_true", help="skip all downloads")
     args = parser.parse_args()
 
     _enable_vt()
+
+    if args.insecure_tls:
+        os.environ["CTPAX_INSECURE_TLS"] = "1"
 
     # --- phase 0: elevation (the real installs need admin; checks stay unelevated) ---
     if not (args.check or args.engine_only or args.selftest) and relaunch_as_admin():
@@ -357,7 +361,7 @@ def main() -> int:
         probes = [
             "json", "zipfile", "tempfile", "shutil", "subprocess", "dataclasses",
             "urllib.request", "urllib.error", "urllib.parse", "http.client", "ssl",
-            "socket", "email.message", "ctypes.wintypes", "importlib.util",
+            "socket", "email.message", "ctypes.wintypes", "importlib.util", "certifi",
         ]
         missing = []
         import importlib
@@ -372,6 +376,22 @@ def main() -> int:
             print("  this build is broken - rebuild the exe")
             return 1
         print(f"  {ok_text('selftest passed')}: all {len(probes)} runtime modules importable")
+
+        # HTTPS probe: exactly the call that failed on a clean machine without a CA bundle
+        try:
+            import certifi
+            import ssl
+            import urllib.request
+
+            context = ssl.create_default_context(cafile=certifi.where())
+            request = urllib.request.Request("https://api.github.com/rate_limit", headers={"User-Agent": "CTPAX-Setup"})
+            with urllib.request.urlopen(request, timeout=20, context=context) as response:
+                response.read(64)
+            print(f"  {ok_text('https ok')}: CA bundle {certifi.where()}")
+        except Exception as exc:
+            print(f"  {YELLOW}https probe failed: {type(exc).__name__}: {exc}{RESET}")
+            print("  if a proxy/AV intercepts TLS, run with --insecure-tls")
+            return 1
         return 0
 
     bar = Progress()
