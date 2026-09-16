@@ -459,6 +459,23 @@ class TestCTPAX(unittest.TestCase):
     def test_usable_python_rejects_nonsense(self):
         self.assertFalse(self.engine._usable_python(["definitely-not-a-python-xyz"]))
 
+    def test_installer_compiles_and_uses_utf8_captures(self):
+        """Two regressions found on a cp1252 VM: a duplicate kwarg, and text=True
+        without an explicit codec (pip's output killed the reader thread)."""
+        import ast
+
+        script = Path(__file__).resolve().parents[1] / "install.py"
+        source = script.read_text(encoding="utf-8-sig")
+        compile(source, str(script), "exec")  # ast.parse ignores duplicate keywords
+        tree = ast.parse(source)
+        offenders = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "run":
+                keywords = {keyword.arg for keyword in node.keywords}
+                if "text" in keywords and "encoding" not in keywords:
+                    offenders.append(node.lineno)
+        self.assertEqual(offenders, [], f"subprocess.run(text=True) without encoding at lines {offenders}")
+
     def test_claude_registration_roundtrip(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / ".claude.json"

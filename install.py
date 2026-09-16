@@ -458,7 +458,7 @@ def _usable_python(command: list[str]) -> bool:
     try:
         result = subprocess.run(
             [*command, "-c", "import sys; print('%d.%d' % sys.version_info[:2])"],
-            capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=60, stdin=subprocess.DEVNULL,
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
@@ -502,7 +502,7 @@ def install_python(target_dir: Path) -> list[str] | None:
             result = subprocess.run(
                 [str(installer), "/quiet", "InstallAllUsers=0", f"TargetDir={target_dir}",
                  "Include_pip=1", "Include_launcher=0", "PrependPath=0", "Include_test=0", "SimpleInstall=1"],
-                capture_output=True, text=True, timeout=1800, stdin=subprocess.DEVNULL,
+                capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=1800, stdin=subprocess.DEVNULL,
             )
             executable = target_dir / "python.exe"
             if executable.is_file() and _usable_python([str(executable)]):
@@ -539,7 +539,7 @@ def build_venv(home: Path, *, recreate: bool) -> Path:
     if base is None:
         die("no usable Python 3.10+ could be found or installed; install Python from python.org and re-run")
     out.info(f"base interpreter: {' '.join(base)}")
-    result = subprocess.run([*base, "-m", "venv", str(venv)], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    result = subprocess.run([*base, "-m", "venv", str(venv)], capture_output=True, text=True, encoding='utf-8', errors='replace', stdin=subprocess.DEVNULL)
     if result.returncode != 0 or not python.exists():
         die(f"could not create a virtual environment at {venv}\n{result.stderr.strip()[:800]}")
     out.ok(str(venv))
@@ -552,7 +552,7 @@ def pip(python: Path, arguments: list[str], *, label: str) -> None:
         # pip has its own CA bundle; a TLS-intercepting proxy still needs trusted hosts
         for host in ("pypi.org", "files.pythonhosted.org", "github.com", "objects.githubusercontent.com"):
             command += ["--trusted-host", host]
-    result = subprocess.run(command, capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    result = subprocess.run(command, capture_output=True, text=True, encoding='utf-8', errors='replace', stdin=subprocess.DEVNULL)
     if result.returncode != 0:
         tail = (result.stderr or result.stdout).strip().splitlines()[-12:]
         die(f"{label} failed:\n      " + "\n      ".join(tail))
@@ -569,6 +569,8 @@ def install_dependencies(python: Path, *, offline: bool) -> None:
         [str(python), "-m", "pip", "install", "--quiet", "--disable-pip-version-check", "--upgrade", "pip"],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
 
     out.info(f"installing {len(REQUIREMENTS)} packages (mcp, lief, capstone, yara, pycryptodome, ...)")
@@ -589,10 +591,12 @@ def install_dependencies(python: Path, *, offline: bool) -> None:
         ],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     if check.returncode != 0:
-        die(f"the installed environment is not importable:\n      {check.stderr.strip()[:600]}")
-    out.ok(f"all dependencies import cleanly (JPype {check.stdout.strip()})")
+        die(f"the installed environment is not importable:\n      {(check.stderr or '').strip()[:600]}")
+    out.ok(f"all dependencies import cleanly (JPype {(check.stdout or '').strip()})")
 
 
 def copy_sources(home: Path) -> Path:
@@ -1217,7 +1221,7 @@ def install_wireshark(offline: bool = False) -> bool:
         result = subprocess.run(
             [winget, "install", "--id", "WiresharkFoundation.Wireshark", "--silent",
              "--accept-package-agreements", "--accept-source-agreements"],
-            capture_output=True, text=True, errors="replace", timeout=1200, stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=1200, stdin=subprocess.DEVNULL,
         )
         if wireshark_installed():
             out.ok("Wireshark installed (tshark, dumpcap)")
@@ -1456,6 +1460,8 @@ asyncio.run(main())
         [str(python), "-c", script],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         env=environment,
         timeout=600,
     )
