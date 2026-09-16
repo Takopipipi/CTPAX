@@ -91,7 +91,7 @@ def die(message: str, *, code: int = 1) -> "NoReturn":  # type: ignore[valid-typ
 
 
 def ask(prompt: str, *, default: str = "") -> str:
-    if not sys.stdin or not sys.stdin.isatty():
+    if NON_INTERACTIVE or not sys.stdin or not sys.stdin.isatty():
         return default
     suffix = f" [{default}]" if default else ""
     try:
@@ -103,7 +103,7 @@ def ask(prompt: str, *, default: str = "") -> str:
 
 
 def confirm(prompt: str, *, default: bool = True) -> bool:
-    if not sys.stdin or not sys.stdin.isatty():
+    if NON_INTERACTIVE or not sys.stdin or not sys.stdin.isatty():
         return default
     hint = "Y/n" if default else "y/N"
     try:
@@ -128,6 +128,175 @@ def load_config_module():
     return config
 
 
+# --------------------------------------------------------------------------
+# prerequisites the toolkit installs for itself: Ghidra, a JDK 21, x64dbg
+# --------------------------------------------------------------------------
+NON_INTERACTIVE = False
+OFFLINE_MODE = False
+INSTALL_ROOT: "Path | None" = None
+
+
+def prereq_dir() -> Path:
+    """Where self-installed tools live: <drive>:\\CTPAX, or next to the install home."""
+    if INSTALL_ROOT is not None:
+        return INSTALL_ROOT
+    return Path(os.environ.get("GHIDRA_MCP_HOME") or (Path.home() / ".ghidra_mcp")).parent
+
+
+def _human_mb(value: int) -> str:
+    return f"{value / 1048576:.0f} MB" if value else "?"
+
+
+def download_file(url: str, destination: Path, label: str, *, timeout: float = 120.0) -> None:
+    """Stream a download to disk, drawing a one-line progress bar."""
+    import urllib.request
+
+    request = urllib.request.Request(url, headers={"User-Agent": "CTPAX-Setup"})
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with urllib.request.urlopen(request, timeout=timeout) as response, open(destination, "wb") as handle:
+        total = int(response.headers.get("Content-Length") or 0)
+        done = 0
+        last = 0.0
+        while True:
+            chunk = response.read(1024 * 256)
+            if not chunk:
+                break
+            handle.write(chunk)
+            done += len(chunk)
+            now = time.time()
+            if now - last > 0.2:
+                last = now
+                if total:
+                    filled = int(24 * done / total)
+                    bar = "#" * filled + "-" * (24 - filled)
+                    sys.stdout.write(f"\r    {label:<26} [{bar}] {done / 1048576:6.1f}/{_human_mb(total)}")
+                else:
+                    sys.stdout.write(f"\r    {label:<26} {done / 1048576:6.1f} MB")
+                sys.stdout.flush()
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+
+
+def _find_marker(root: Path, marker: str) -> Path | None:
+    if not root.is_dir():
+        return None
+    for candidate in root.rglob(marker):
+        return candidate
+    return None
+
+
+def _github_latest(api_url: str) -> dict:
+    import urllib.request
+
+    request = urllib.request.Request(api_url, headers={"User-Agent": "CTPAX-Setup", "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return json.loads(response.read())
+
+
+def install_ghidra(target_dir: Path) -> Path | None:
+    """Download and unpack the latest Ghidra release; returns its home directory."""
+    import zipfile
+
+    marker = _find_marker(target_dir, "analyzeHeadless.bat")
+    if marker is not None:
+        home = marker.parent.parent
+        out.ok(f"Ghidra (self-installed): {home}")
+        return home
+    try:
+        release = _github_latest("https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/latest")
+        asset = next(
+            (a for a in release.get("assets", []) if a["name"].lower().endswith(".zip") and "public" in a["name"].lower()),
+            None,
+        )
+        if asset is None:
+            out.warn("the latest Ghidra release has no PUBLIC zip asset")
+            return None
+        out.info(f"downloading {asset['name']} ({_human_mb(asset.get('size', 0))}) - one time, ~500MB")
+        archive = target_dir.parent / "_ghidra_download.zip"
+        download_file(asset["browser_download_url"], archive, "Ghidra", timeout=1800)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(archive) as bundle:
+            bundle.extractall(target_dir)
+        archive.unlink(missing_ok=True)
+        marker = _find_marker(target_dir, "analyzeHeadless.bat")
+        if marker is None:
+            out.warn("the Ghidra archive layout was unexpected")
+            return None
+        home = marker.parent.parent
+        out.ok(f"Ghidra {release.get('tag_name')} installed: {home}")
+        return home
+    except Exception as exc:
+        out.warn(f"could not install Ghidra automatically ({exc})")
+        return None
+
+
+def install_jdk(target_dir: Path) -> Path | None:
+    """Download Eclipse Temurin JDK 21 and unpack it; returns JAVA_HOME."""
+    import zipfile
+
+    marker = _find_marker(target_dir, "java.exe")
+    if marker is not None:
+        home = marker.parent.parent
+        out.ok(f"JDK (self-installed): {home}")
+        return home
+    try:
+        api = ("https://api.adoptium.net/v3/assets/latest/21/hotspot"
+               "?architecture=x64&image_type=jdk&os=windows&vendor=eclipse")
+        payload = _github_latest(api)
+        package = payload[0]["binary"]["package"]
+        out.info(f"downloading {package['name']} ({_human_mb(package.get('size', 0))})")
+        archive = target_dir.parent / "_jdk_download.zip"
+        download_file(package["link"], archive, "JDK 21 (Temurin)")
+        target_dir.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(archive) as bundle:
+            bundle.extractall(target_dir)
+        archive.unlink(missing_ok=True)
+        marker = _find_marker(target_dir, "java.exe")
+        if marker is None:
+            out.warn("the JDK archive layout was unexpected")
+            return None
+        home = marker.parent.parent
+        out.ok(f"JDK 21 installed: {home}")
+        return home
+    except Exception as exc:
+        out.warn(f"could not install a JDK automatically ({exc})")
+        return None
+
+
+def install_x64dbg(target_dir: Path) -> Path | None:
+    """Download the x64dbg snapshot (x64 build) and return the folder with x64dbg.exe."""
+    import zipfile
+
+    marker = _find_marker(target_dir, "x64dbg.exe")
+    if marker is not None:
+        root = marker.parent.parent if marker.parent.name.lower() == "x64" else marker.parent
+        out.ok(f"x64dbg (self-installed): {root}")
+        return root
+    try:
+        release = _github_latest("https://api.github.com/repos/x64dbg/x64dbg/releases/latest")
+        asset = next((a for a in release.get("assets", []) if a["name"].startswith("snapshot_") and a["name"].endswith(".zip")), None)
+        if asset is None:
+            out.warn("the latest x64dbg release has no snapshot zip")
+            return None
+        out.info(f"downloading {asset['name']} ({_human_mb(asset.get('size', 0))})")
+        archive = target_dir.parent / "_x64dbg_download.zip"
+        download_file(asset["browser_download_url"], archive, "x64dbg")
+        target_dir.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(archive) as bundle:
+            bundle.extractall(target_dir)
+        archive.unlink(missing_ok=True)
+        marker = _find_marker(target_dir, "x64dbg.exe")
+        if marker is None:
+            out.warn("the x64dbg archive layout was unexpected")
+            return None
+        root = marker.parent.parent if marker.parent.name.lower() == "x64" else marker.parent
+        out.ok(f"x64dbg installed: {root}")
+        return root
+    except Exception as exc:
+        out.warn(f"could not install x64dbg automatically ({exc})")
+        return None
+
+
 def find_ghidra(config, preset: str | None) -> Path:
     out.step("Locating Ghidra")
     if preset:
@@ -150,6 +319,14 @@ def find_ghidra(config, preset: str | None) -> Path:
         if confirm("Use this installation?"):
             return found
 
+    # nothing on the machine: install one into the toolkit's own folder
+    if not OFFLINE_MODE:
+        installed = install_ghidra(prereq_dir() / "ghidra")
+        if installed is not None:
+            return installed
+
+    if NON_INTERACTIVE:
+        die("Ghidra was not found and could not be downloaded. Check the network and re-run.")
     print()
     out.info("Ghidra was not found automatically.")
     out.info("Enter the folder that contains 'support\\analyzeHeadless.bat',")
@@ -184,6 +361,15 @@ def find_java(config, preset: str | None, ghidra_dir: Path) -> Path:
     if found:
         out.ok(f"{found} (Java {config.java_version_of(found)})")
         return found
+
+    # nothing usable: install Temurin 21 into the toolkit's own folder
+    if not OFFLINE_MODE:
+        installed = install_jdk(prereq_dir() / "jdk")
+        if installed is not None and config.has_jvm_library(installed):
+            return installed
+
+    if NON_INTERACTIVE:
+        die(f"A JDK {MIN_JAVA}+ is required and could not be downloaded. Check the network and re-run.")
 
     print()
     out.info(f"No JDK {MIN_JAVA}+ was found. Ghidra needs a full JDK, not a JRE.")
@@ -1206,13 +1392,19 @@ X64DBG_PLUGIN_FILES_64 = ("x64dbg-automate.dp64", "libzmq-mt-4_3_5.dll")
 X64DBG_PLUGIN_FILES_32 = ("x64dbg-automate.dp32", "libzmq-mt-4_3_5.dll")
 
 
-def find_x64dbg_root() -> Path | None:
-    """Locate the unpacked x64dbg 'release' folder, mirroring the server's search."""
+def find_x64dbg_root(*, auto_install: bool = True) -> Path | None:
+    """Locate the unpacked x64dbg 'release' folder, mirroring the server's search.
+
+    With ``auto_install`` the latest snapshot is downloaded into the toolkit's own
+    folder when nothing is found, so dynamic analysis works on a clean machine.
+    """
     candidates = []
     override = os.environ.get("X64DBG_DIR")
     if override:
         candidates.append(Path(override))
+    local = prereq_dir() / "x64dbg" / "release"
     candidates += [
+        local,
         Path("C:/x64dbg/release"),
         Path("C:/Program Files/x64dbg/release"),
         Path("C:/Program Files (x86)/x64dbg/release"),
@@ -1222,6 +1414,11 @@ def find_x64dbg_root() -> Path | None:
     for candidate in candidates:
         if (candidate / "x96dbg.exe").is_file() or (candidate / "x64dbg.exe").is_file():
             return candidate
+    if auto_install and not OFFLINE_MODE:
+        installed = install_x64dbg(prereq_dir() / "x64dbg")
+        if installed is not None:
+            if (installed / "x96dbg.exe").is_file() or (installed / "x64dbg.exe").is_file():
+                return installed
     return None
 
 
@@ -1408,6 +1605,7 @@ def _tick(stage: str, fraction: float) -> None:
 
 
 def do_install(arguments: argparse.Namespace) -> int:
+    global NON_INTERACTIVE, OFFLINE_MODE, INSTALL_ROOT
     print("=" * 72)
     print("  Ghidra MCP server - installer")
     print("=" * 72)
@@ -1417,6 +1615,9 @@ def do_install(arguments: argparse.Namespace) -> int:
 
     home = Path(arguments.home).expanduser() if arguments.home else config.default_home()
     check_install_path(home)
+    NON_INTERACTIVE = bool(getattr(arguments, "yes", False))
+    OFFLINE_MODE = bool(arguments.offline)
+    INSTALL_ROOT = home.parent  # self-installed Ghidra/JDK/x64dbg live beside the home
     out.info(f"install location: {home}")
     _tick("checking the environment", 0.04)
 
@@ -1632,6 +1833,7 @@ def main() -> int:
     parser.add_argument("--claude", action="store_true", help="also register in Claude Code (~/.claude.json)")
     parser.add_argument("--codex", action="store_true", help="also register in Codex (~/.codex/config.toml)")
     parser.add_argument("--all-clients", action="store_true", help="register in every AI client detected on this machine (opencode, cursor, claude code, codex)")
+    parser.add_argument("--yes", action="store_true", help="never prompt: download prerequisites automatically and answer defaults (used by CTPAX)")
     parser.add_argument("--heap", default="4G", help="JVM maximum heap for analysis (default 4G)")
     parser.add_argument("--recreate-venv", action="store_true", help="rebuild the virtual environment from scratch")
     parser.add_argument("--offline", action="store_true", help="do not install packages")

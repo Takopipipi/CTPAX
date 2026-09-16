@@ -426,6 +426,29 @@ class TestCTPAX(unittest.TestCase):
         for glyph in ("C", "T", "P", "A", "X"):
             self.assertIn(glyph, ctpax_setup._GLYPH_ROWS)
 
+    def test_noninteractive_never_prompts(self):
+        saved = getattr(self.engine, "NON_INTERACTIVE", False)
+        try:
+            self.engine.NON_INTERACTIVE = True
+            self.assertEqual(self.engine.ask("anything", default="fallback"), "fallback")
+            self.assertTrue(self.engine.confirm("proceed?", default=True))
+            self.assertFalse(self.engine.confirm("proceed?", default=False))
+        finally:
+            self.engine.NON_INTERACTIVE = saved
+
+    def test_prereq_dir_follows_install_root(self):
+        saved = getattr(self.engine, "INSTALL_ROOT", None)
+        try:
+            self.engine.INSTALL_ROOT = Path("X:/CTPAX/GhidraMCP").parent
+            self.assertEqual(self.engine.prereq_dir(), Path("X:/CTPAX"))
+        finally:
+            self.engine.INSTALL_ROOT = saved
+
+    def test_auto_install_helpers_exist(self):
+        # the install path must be able to fetch every prerequisite itself
+        for name in ("install_ghidra", "install_jdk", "install_x64dbg", "download_file"):
+            self.assertTrue(callable(getattr(self.engine, name)), name)
+
     def test_claude_registration_roundtrip(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / ".claude.json"

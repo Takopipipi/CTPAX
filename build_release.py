@@ -58,14 +58,42 @@ def ensure_pyinstaller() -> None:
     subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "pyinstaller"], check=True)
 
 
+def _runtime_imports() -> list[str]:
+    """Top-level package names that install.py (and its config helper) import.
+
+    install.py is loaded at runtime by the frozen exe, so PyInstaller cannot see its
+    imports: without this list the exe starts, extracts the payload and then dies on
+    ``ModuleNotFoundError: No module named 'json'``.
+    """
+    import ast
+
+    packages: set[str] = set()
+    sources = [ROOT / "install.py", ROOT / "ctpax_setup.py", ROOT / "src" / "ghidra_mcp" / "config.py"]
+    for source in sources:
+        if not source.is_file():
+            continue
+        tree = ast.parse(source.read_text(encoding="utf-8-sig"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    packages.add(alias.name.split(".")[0])
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                packages.add(node.module.split(".")[0])
+    # ghidra_mcp is a local package shipped in the payload; everything else must be bundled
+    return sorted(name for name in packages if name != "ghidra_mcp")
+
+
 def build() -> Path:
     ensure_pyinstaller()
     pack_payload()
+    hidden = _runtime_imports()
+    print(f"bundling runtime imports: {', '.join(hidden)}")
     command = [
         sys.executable, "-m", "PyInstaller",
         "--onefile", "--noconfirm", "--clean",
         "--name", "CTPAX-Setup",
         "--add-data", f"{PAYLOAD}{';' if sys.platform == 'win32' else ':'}.",
+        *[f"--hidden-import={name}" for name in hidden],
         str(ROOT / "ctpax_setup.py"),
     ]
     print("building with PyInstaller (one file, this takes a minute) ...")

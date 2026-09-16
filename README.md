@@ -23,14 +23,20 @@ comments, and types from a previous session remain in place.
 ### CTPAX.bat - the one-shot installer
 
 Double-click `CTPAX.bat` (source) or `CTPAX-Setup.exe` (the release build; no Python
-needed on the target machine). It prints the banner, scans the fixed drives, picks the
-one with the most free space, copies the whole project into `<drive>:\CTPAX`, then
-installs everything with a live console progress bar: **Ghidra and JDK 21 are
-downloaded automatically when missing** (into `<drive>:\CTPAX\ghidra` and `\jdk`),
-followed by venv + dependencies, x64dbg plugins (automation + ScyllaHide), Nuclei with
-its ~13k template repo, and the Wireshark CLI tools. At the end it registers the MCP
-server into every AI client it finds on the machine: OpenCode, Cursor, Claude Code,
-Codex. Re-running is safe - it updates in place.
+needed on the target machine). It **asks Windows for administrator rights by itself**
+(UAC), prints the banner, scans the fixed drives, picks the one with the most free
+space, copies the whole project into `<drive>:\CTPAX`, then installs everything with a
+live console progress bar - and it never asks you for paths: missing prerequisites are
+downloaded into the toolkit folder automatically:
+
+- **Ghidra** (latest release, ~540MB) -> `<drive>:\CTPAX\ghidra`
+- **JDK 21** (Eclipse Temurin, ~200MB) -> `<drive>:\CTPAX\jdk`
+- **x64dbg** (latest snapshot) -> `<drive>:\CTPAX\x64dbg`, plus the automation plugin and ScyllaHide
+- **Nuclei** + its ~13k template repo, **Wireshark** CLI tools (winget)
+- venv + Python dependencies for the server itself
+
+At the end it registers the MCP server into every AI client it finds on the machine:
+OpenCode, Cursor, Claude Code, Codex. Re-running is safe - it updates in place.
 
 ```
 CTPAX.bat                 <- install into the biggest drive, register all detected clients
