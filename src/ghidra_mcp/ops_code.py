@@ -455,8 +455,11 @@ def decompile_grep(session: Session, params: dict[str, Any], progress: Callable[
     max_hits = clamp(params.get("max_hits"), 1, 500, 60)
     context = clamp(params.get("context_lines"), 0, 10, 2)
     timeout = clamp(params.get("timeout"), 5, 300, 45)
+    time_limit = clamp(params.get("time_limit"), 10, 600, 240)
     name_filter = (params.get("filter") or "").lower()
     min_size = clamp(params.get("min_size"), 0, 10**9, 0)
+
+    total_functions = int(entry.program.getFunctionManager().getFunctionCount())
 
     candidates = []
     for function in entry.program.getFunctionManager().getFunctions(True):
@@ -475,11 +478,19 @@ def decompile_grep(session: Session, params: dict[str, Any], progress: Callable[
     scanned = 0
     failed = 0
     started = time.time()
+    stopped = "exhausted"
     for function in candidates:
         session.check_cancel()
         scanned += 1
         if scanned % 25 == 0:
             progress(stage="grep", scanned=scanned, of=len(candidates), hits=len(hits))
+        elapsed = time.time() - started
+        if elapsed > time_limit:
+            # A hard client cut (-32001) would otherwise kill the whole request on big
+            # binaries while the worker stays stuck decompiling behind a dead socket -
+            # the single worker thread then blocks every later call for minutes.
+            stopped = "time_limit"
+            break
         try:
             source, _ = _decompile(session, entry, function, timeout)
         except Exception:
@@ -502,18 +513,35 @@ def decompile_grep(session: Session, params: dict[str, Any], progress: Callable[
             )
             break  # one hit per function keeps the result readable
         if len(hits) >= max_hits:
+            stopped = "max_hits"
             break
+
+    note = None
+    if stopped == "time_limit":
+        remaining = total_functions - scanned
+        note = (
+            f"time limit of {time_limit}s reached after {scanned} of {total_functions} "
+            f"functions ({remaining} left, {failed} failed to decompile). Narrow with "
+            "filter= (function-name substring) or min_size=, raise time_limit (max 600), or "
+            "scan in the background: job_start('decompile_search', {...}) and poll job_status."
+        )
+    elif stopped == "exhausted" and not hits:
+        note = "no function matched - try a different query or drop regex/case_sensitive."
 
     return {
         "program": entry.key,
         "query": str(query),
         "regex": is_regex,
+        "total_functions": total_functions,
         "functions_scanned": scanned,
         "functions_considered": len(candidates),
         "decompile_failures": failed,
         "seconds": round(time.time() - started, 1),
+        "time_limit": time_limit,
+        "stopped": stopped,
         "hit_count": len(hits),
         "truncated": len(hits) >= max_hits,
+        "note": note,
         "hits": hits,
     }
 

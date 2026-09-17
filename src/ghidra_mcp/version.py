@@ -22,7 +22,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 REPO = "Takopipipi/CTPAX"
 _RELEASE_API = f"https://api.github.com/repos/{REPO}/releases/latest"

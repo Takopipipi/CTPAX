@@ -376,14 +376,23 @@ def decompile_search(
     context_lines: int = 2,
     filter: str | None = None,
     min_size: int = 0,
+    time_limit: float = 240.0,
     request_timeout: float = 900.0,
 ) -> str:
     """Search the decompiled C of the whole binary for a pattern.
 
     How you find behaviour when every symbol is stripped: grep the decompilation for
     ``VirtualAlloc``, a magic constant, ``memcmp``, or a regex to locate XOR loops. It
-    decompiles as it goes, making it the most expensive tool here - bound it with
-    ``max_functions``, ``filter``, or ``min_size``, and prefer ``job_start`` on a big binary.
+    decompiles as it goes, making it the most expensive tool here.
+
+    Because a full pass on a large binary (say 35k functions) can outlive any client
+    timeout and end as -32001, the scan stops at a ``time_limit`` (default 240s, max
+    600s) and returns what it has so far with a clear ``note`` - it never parks the
+    worker on a dead socket. To scan more in the background instead of blocking:
+    ``job_start('decompile_search', {...})`` and poll ``job_status``.
+
+    Narrow an expensive binary with ``filter`` (function-name substring) or ``min_size``
+    before raising the limits; ``max_functions`` caps the budget at 6000.
     """
     return ghidra(
         "decompile_grep",
@@ -398,6 +407,7 @@ def decompile_search(
                 "context_lines": context_lines,
                 "filter": filter,
                 "min_size": min_size,
+                "time_limit": time_limit,
             }
         ),
         timeout=request_timeout,
