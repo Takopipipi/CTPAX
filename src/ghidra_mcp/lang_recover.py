@@ -48,11 +48,13 @@ _JVM_ENGINES = {
     "cfr": ("cfr.jar", ["https://repo1.maven.org/maven2/org/benf/cfr/0.152/cfr-0.152.jar"]),
     "procyon": (
         "procyon-decompiler.jar",
-        # no live mirror: Central never hosted the decompiler artifact, JCenter is dead
-        # (would-be com.github.kwart), Bitbucket downloads are gone, and jitpack builds
-        # of mstrobel/procyon do not publish the submodule jar. The engine is still fully
-        # wired - drop the jar at <home>/bin/jvm/procyon-decompiler.jar to enable it.
-        [],
+        # Official GitHub release distribution of Procyon 0.6.0. This exact asset is
+        # what Homebrew, Fedora Packaging and termux scripts consume:
+        #   https://github.com/mstrobel/procyon/releases/download/v0.6.0/procyon-decompiler-0.6.0.jar
+        # sha256 821da96012fc69244fa1ea298c90455ee4e021434bc796d3b9546ab24601b779 (1.9 MB).
+        # (Central never hosted the decompiler artifact; JCenter is dead; Bitbucket
+        # downloads are gone; jitpack publishes only an empty placeholder.jar.)
+        ["https://github.com/mstrobel/procyon/releases/download/v0.6.0/procyon-decompiler-0.6.0.jar"],
     ),
     "jd": (
         "jd-cli.jar",
