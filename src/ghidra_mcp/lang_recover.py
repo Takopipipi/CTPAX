@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import struct
 import subprocess
+import sys
 import tempfile
 import time
 import zipfile
@@ -40,55 +41,141 @@ def _java() -> str | None:
     return None
 
 
+_EFN = "med"  # engine fallback note (kept local so the note below reads naturally)
+
+_JVM_ENGINES = {
+    # name -> (jar filename, [mirror download urls])
+    "cfr": ("cfr.jar", ["https://repo1.maven.org/maven2/org/benf/cfr/0.152/cfr-0.152.jar"]),
+    "procyon": (
+        "procyon-decompiler.jar",
+        # no live mirror: Central never hosted the decompiler artifact, JCenter is dead
+        # (would-be com.github.kwart), Bitbucket downloads are gone, and jitpack builds
+        # of mstrobel/procyon do not publish the submodule jar. The engine is still fully
+        # wired - drop the jar at <home>/bin/jvm/procyon-decompiler.jar to enable it.
+        [],
+    ),
+    "jd": (
+        "jd-cli.jar",
+        # kwart/jd-cli lives on Central as groupId com.github.kwart.jd, artifact jd-cli.
+        ["https://repo1.maven.org/maven2/com/github/kwart/jd/jd-cli/1.2.1/jd-cli-1.2.1.jar"],
+    ),
+}
+
+
+def _fetch(urls: list[str], destination: Path, label: str, timeout: float = 180.0) -> dict[str, Any]:
+    """Download to ``destination`` trying each URL, returning an outcome dict."""
+    import ssl as ssl_module
+    import urllib.request
+
+    context = None
+    if os.environ.get("CTPAX_INSECURE_TLS"):
+        context = ssl_module._create_unverified_context()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    last_error = None
+    for url in urls:
+        try:
+            if context is not None:
+                with urllib.request.urlopen(url, timeout=timeout, context=context) as response:
+                    data = response.read()
+                destination.write_bytes(data)
+            else:
+                urllib.request.urlretrieve(url, destination)
+            return {"ready": True, "path": str(destination), "bytes": destination.stat().st_size, "from": url}
+        except Exception as exc:
+            last_error = exc
+    return {"ready": False, "label": label, "error": str(last_error)}
+
+
+def java_engine_status(engine: str) -> dict[str, Any]:
+    """Is a given JVM decompiler engine's jar present (and its java available)?"""
+    if engine not in _JVM_ENGINES:
+        return {"error": f"unknown engine {engine!r}; known: {', '.join(_JVM_ENGINES)}"}
+    name, _ = _JVM_ENGINES[engine]
+    jar = _CFR_DIR / name
+    return {
+        "engine": engine,
+        "jar": str(jar),
+        "ready": jar.is_file() and _java() is not None,
+        "downloaded": jar.is_file(),
+        "java": _java(),
+    }
+
+
+def _ensure_engine(engine: str) -> dict[str, Any]:
+    """Download one JVM decompiler engine's jar (idempotent); also re-fetches CFR."""
+    name, urls = _JVM_ENGINES[engine]
+    jar = _CFR_DIR / name
+    if jar.is_file():
+        java = _java()
+        if java is None:
+            return {"ready": False, "error": "no java.exe found (JAVA_HOME unset and not on PATH); a JVM decompiler needs it"}
+        return {"ready": True, "jar": str(jar), "downloaded": "already present"}
+    if not urls:
+        java = _java()
+        if java is None:
+            return {"ready": False, "engine": engine, "error": "no java.exe found (JAVA_HOME unset and not on PATH)"}
+        return {
+            "ready": False,
+            "engine": engine,
+            "error": f"{engine} has no working auto-download mirror (upstream distributions are gone)",
+            "hint": f"drop the jar yourself at {jar} and retry",
+        }
+    result = _fetch(urls, jar, engine)
+    if not result.get("ready"):
+        return result
+    java = _java()
+    if java is None:
+        return {"ready": False, "error": "downloaded, but no java.exe found (JAVA_HOME unset and not on PATH)"}
+    return {"ready": True, "jar": str(jar), "downloaded": f"{engine} {result.get('bytes')} bytes"}
+
+
 def ensure_cfr() -> dict[str, Any]:
     """Download CFR once (it is a single jar, no installer)."""
     if _CFR_JAR.is_file():
         return {"jar": str(_CFR_JAR), "ready": True, "downloaded": "already present"}
-    import urllib.request
-
-    _CFR_DIR.mkdir(parents=True, exist_ok=True)
-    urls = [
-        "https://repo1.maven.org/maven2/org/benf/cfr/0.152/cfr-0.152.jar",
-        "https://repo1.maven.org/maven2/org/benf/cfr/0.150/cfr-0.150.jar",
-    ]
-    last_error = None
-    for url in urls:
-        try:
-            urllib.request.urlretrieve(url, _CFR_JAR)
-            return {"jar": str(_CFR_JAR), "ready": True, "downloaded": url.rsplit("/", 1)[-1]}
-        except Exception as exc:
-            last_error = exc
-    return {"ready": False, "error": f"could not download CFR: {last_error}"}
+    result = _ensure_engine("cfr")
+    if result.get("ready"):
+        result["jar"] = str(_CFR_JAR)
+    return result
 
 
-def decompile_java(path: str, *, extra_args: str = "") -> dict[str, Any]:
-    """Decompile a jar/class file to (nearly) original Java source with CFR.
+def decompile_java(path: str, *, engine: str = "cfr", extra_args: str = "") -> dict[str, Any]:
+    """Decompile a jar/class file to (nearly) original Java source.
 
-    CFR reconstructs control flow, generics and lambdas. For a jar the output is
-    per-class; for a single class it is one file. This is the closest to real source
+    Engines: ``cfr`` (default - best generics/control-flow recovery), ``procyon``
+    (aggressive at reconstructing switch/closure patterns), ``jd`` (jd-cli, quickest).
+    Each is a single jar downloaded on first use into <home>/bin. For a jar the output
+    is per-class; for a single class it is one file. This is the closest to real source
     recovery this toolkit offers - most obfuscated-but-valid jars decompile outright.
     """
-    jar = ensure_cfr()
+    if engine not in _JVM_ENGINES:
+        return {"error": f"unknown engine {engine!r}; known: {', '.join(_JVM_ENGINES)}"}
+    jar = _ensure_engine(engine)
     if not jar.get("ready"):
         return jar
     java = _java()
     if java is None:
-        return {"error": "no java.exe found (JAVA_HOME unset and not on PATH); CFR needs it"}
+        return {"error": "no java.exe found (JAVA_HOME unset and not on PATH); the decompiler needs it"}
     target = Path(path)
     if not target.is_file():
         return {"error": f"no such file: {target}"}
 
-    out_dir = Path(tempfile.mkdtemp(prefix="cfr_out_"))
-    command = [java, "-jar", jar["jar"], str(target), f"--outputdir", str(out_dir)]
+    out_dir = Path(tempfile.mkdtemp(prefix=f"{engine}_out_"))
+    if engine == "cfr":
+        command = [java, "-jar", jar["jar"], str(target), f"--outputdir", str(out_dir)]
+    elif engine == "procyon":
+        command = [java, "-jar", jar["jar"], str(target), "-o", str(out_dir)]
+    else:  # jd
+        command = [java, "-jar", jar["jar"], "-od", str(out_dir), str(target)]
     if extra_args:
         command += extra_args.split()
     started = time.time()
     try:
         result = subprocess.run(command, capture_output=True, text=True, errors="replace", timeout=600, stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
-        return {"error": "CFR did not finish within 600s; try decompiling a single class instead"}
+        return {"error": f"{engine} did not finish within 600s; try decompiling a single class instead"}
     if result.returncode != 0:
-        return {"error": f"CFR failed: {(result.stderr or result.stdout)[-400:]}", "elapsed": round(time.time() - started, 1)}
+        return {"error": f"{engine} failed: {(result.stderr or result.stdout)[-400:]}", "elapsed": round(time.time() - started, 1)}
 
     sources = sorted(out_dir.rglob("*.java"))
     total_lines = 0
@@ -107,7 +194,7 @@ def decompile_java(path: str, *, extra_args: str = "") -> dict[str, Any]:
         "elapsed": round(time.time() - started, 1),
         "output_dir": str(out_dir),
         "files": listing[:100],
-        "note": "read the files with file tools; they are plain .java sources",
+        "note": f"decompiled with {engine}; read the files with file tools - they are plain .java sources",
     }
 
 
@@ -323,3 +410,261 @@ def pdb_download(path: str, *, out_dir: str | None = None) -> dict[str, Any]:
         except Exception as exc:
             downloaded.append({"pdb": entry["pdb"], "error": f"{type(exc).__name__}: not on the public server or network blocked"})
     return {"file": str(path), "results": downloaded}
+
+
+# --------------------------------------------------------------------------
+# Python: bytecode info + decompilation (pycdc, uncompyle6, decompyle3)
+# --------------------------------------------------------------------------
+# Magic numbers for the bytecode the .pyc was compiled with; the auto-pick in
+# decompile_python goes from these. Values are the standard CPython magics.
+_PYC_MAGICS = {
+    62211: "2.7",
+    3180: "3.2",
+    3231: "3.3",
+    3301: "3.4",
+    3320: "3.5",
+    3379: "3.6",
+    3390: "3.6.1",
+    3394: "3.7",
+    3413: "3.8",
+    3425: "3.9",
+    3439: "3.10",
+    3495: "3.11",
+    3531: "3.12",
+    3560: "3.13",
+}
+
+
+def _pycdc_dir() -> Path:
+    return SETTINGS.home / "bin" / "pycdc"
+
+
+def _pycdc_exe() -> Path | None:
+    for candidate in (_pycdc_dir() / "pycdc.exe", _pycdc_dir() / "samczsun" / "pycdc.exe", _pycdc_dir() / "bin" / "pycdc.exe"):
+        if candidate.is_file():
+            return candidate
+    for found in sorted(_pycdc_dir().rglob("pycdc.exe")):
+        return found
+    return None
+
+
+def ensure_pycdc() -> dict[str, Any]:
+    """Fetch a prebuilt pycdc for Windows once into <home>/bin/pycdc."""
+    if _pycdc_exe() is not None:
+        return {"ready": True, "exe": str(_pycdc_exe()), "installed": "already present"}
+    # zrsx/pycdc ships binaries only as GitHub Actions artifacts (auth-gated), so the
+    # release-tracked builds are the reliable sources: extremecoders-re's CI and the
+    # tahmidrayat mirror both publish pycdc-windows.zip on every successful build.
+    candidate_suffixes = ["pycdc-windows.zip", "pycdc-windows-mingw.zip"]
+    from ghidra_mcp import managed
+
+    for repo in ("extremecoders-re/decompyle-builds", "tahmidrayat/pycdc-windows"):
+        info = None
+        for suffix in candidate_suffixes:
+            info = managed._latest_asset(repo, suffix)
+            if info.get("ok"):
+                break
+        if not (info or {}).get("ok"):
+            continue
+        archive = SETTINGS.home / "bin" / "pycdc.zip"
+        result = managed._download([info["url"]], archive, "pycdc")
+        if not result.get("ready"):
+            continue
+        _pycdc_dir().mkdir(parents=True, exist_ok=True)
+        try:
+            with zipfile.ZipFile(archive) as bundle:
+                bundle.extractall(_pycdc_dir())
+            archive.unlink(missing_ok=True)
+        except Exception as exc:
+            return {"ready": False, "error": f"unzip failed: {exc}"}
+        exe = _pycdc_exe()
+        if exe is not None:
+            return {"ready": True, "exe": str(exe), "downloaded": f"{repo}@{info.get('tag')}"}
+    return {
+        "ready": False,
+        "error": "could not fetch a pycdc Windows build",
+        "hint": "install uncompyle6/decompyle3 (pip) and rely on engine auto-pick instead",
+    }
+
+
+def _run_module_python_decompiler(module: str, path: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-m", module, path],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=600, stdin=subprocess.DEVNULL,
+    )
+
+
+def pyc_info(path: str) -> dict[str, Any]:
+    """Read a .pyc's header: magic, target Python version, mtime, optional size.
+
+    On-disk magic is a 4-byte little-endian value whose low 16 bits are the classic
+    CPython magic table; the header layout after it differs by version (3.7: 12
+    bytes, 3.8+: 16 bytes with mtime+size, 3.11+: pad preserved, <=3.6: 8 bytes).
+    The bytecode version drives which decompiler is most likely to succeed.
+    """
+    from ghidra_mcp.static_analysis import read_file
+
+    raw = read_file(path, offset=0, length=32)
+    if len(raw) < 8:
+        return {"error": "file is not a Python bytecode (too short)"}
+    magic_u32 = int.from_bytes(raw[0:4], "little")
+    magic = magic_u32 & 0xFFFF
+    version = _PYC_MAGICS.get(magic) or "unknown"
+    version_digits = [p for p in version.split(".") if p.isdigit()]
+    major = int(version_digits[0]) if version_digits else 3
+    import datetime as dt
+
+    def _parse() -> dict[str, Any]:
+        if major >= 3 and (magic >= 3413):  # 3.8+: magic(4) flags(2) pad(2) mtime(4) size(4)
+            flags = int.from_bytes(raw[4:6], "little")
+            mtime = int.from_bytes(raw[8:12], "little")
+            size = int.from_bytes(raw[12:16], "little")
+            header = 16
+        elif major >= 3 and magic >= 3394:  # 3.7: magic(4) flags(2) mtime(4)
+            flags = int.from_bytes(raw[4:6], "little")
+            mtime = int.from_bytes(raw[6:10], "little")
+            size = None
+            header = 12
+        else:  # <= 3.6: magic(4) mtime(4)
+            flags = None
+            mtime = int.from_bytes(raw[4:8], "little")
+            size = None
+            header = 8
+        try:
+            stamp = dt.datetime.fromtimestamp(mtime, dt.timezone.utc).isoformat() if mtime else None
+        except (OverflowError, OSError, ValueError):
+            stamp = None
+        return {"flags": flags, "header_bytes": header, "mtime_utc": stamp, "source_size": size, "mtime_raw": mtime}
+
+    parsed = _parse()
+    parsed.update(
+        {
+            "file": str(path),
+            "magic": magic,
+            "magic_u32": magic_u32,
+            "python_version": version,
+            "pyc_size": Path(path).stat().st_size,
+            "leading_hex": raw[:min(16, len(raw))].hex(" "),
+            "note": "uncompyle6/decompyle3 cover 2.7-3.8 well; pycdc handles 3.9+; decompile_python auto-picks",
+        }
+    )
+    return parsed
+
+
+def python_decompiler_status() -> dict[str, Any]:
+    """Which Python decompilers are usable right now (pycdc, uncompyle6, decompyle3)."""
+    import importlib.util
+
+    return {
+        "pycdc": {"ready": _pycdc_exe() is not None, "exe": str(_pycdc_exe()) if _pycdc_exe() else None},
+        "uncompyle6": {"ready": importlib.util.find_spec("uncompyle6") is not None},
+        "decompyle3": {"ready": importlib.util.find_spec("decompyle3") is not None},
+        "note": "pycdc download is automatic on first decompile; uncompyle6/decompyle3 install with pip",
+    }
+
+
+def _pick_python_engine(major: int, minor: int, has_pycdc: bool, has_uncompyle6: bool, has_decompyle3: bool) -> str | None:
+    """Choose a decompiler by bytecode version: 3.9+ gets pycdc (uncompyle6's
+    range ends around 3.8/3.9), the rest prefer uncompyle6, then decompyle3."""
+    if major >= 3 and minor >= 9 and has_pycdc:
+        return "pycdc"
+    if has_uncompyle6:
+        return "uncompyle6"
+    if has_decompyle3:
+        return "decompyle3"
+    if has_pycdc:
+        return "pycdc"
+    return None
+
+
+def decompile_python(path: str, *, engine: str = "auto") -> dict[str, Any]:
+    """Decompile a .pyc to Python source.
+
+    Engine selection: ``auto`` (default) picks by the bytecode's CPython magic -
+    uncompyle6/decompyle3 for 2.7-3.8, pycdc for 3.9+ with fallback to uncompyle6 for
+    the versions it still handles. Pass ``pycdc``, ``uncompyle6``, or ``decompyle3``
+    to force one. The chosen module runs in this server's interpreter.
+    """
+    target = Path(path)
+    if not target.is_file():
+        return {"error": f"no such file: {target}"}
+    info = pyc_info(str(target))
+    version = (info.get("python_version") or "").split(".")[:2]
+    minor = int(version[1]) if version and version[0].isdigit() and len(version) > 1 and version[1].isdigit() else 0
+    major = int(version[0]) if version and version[0].isdigit() else 3
+    py3 = major >= 3
+
+    import importlib.util
+    import sys as _sys
+
+    has_pycdc = _pycdc_exe() is not None
+    has_u6 = importlib.util.find_spec("uncompyle6") is not None
+    has_d3 = importlib.util.find_spec("decompyle3") is not None
+
+    if engine == "auto":
+        if not (has_pycdc or has_u6 or has_d3):
+            ensure_pycdc()
+            has_pycdc = _pycdc_exe() is not None
+            has_u6 = importlib.util.find_spec("uncompyle6") is not None
+            has_d3 = importlib.util.find_spec("decompyle3") is not None
+        chosen = _pick_python_engine(major, minor, has_pycdc, has_u6, has_d3)
+        if chosen is None:
+            return {"error": "no Python decompiler available; run install.bat again or: pip install uncompyle6 decompyle3"}
+        engine = chosen
+
+    started = time.time()
+    if engine == "pycdc":
+        ready = ensure_pycdc()
+        if not ready.get("ready"):
+            return ready
+        try:
+            result = subprocess.run([ready["exe"], str(target)], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=600, stdin=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            return {"error": "pycdc did not finish within 600s"}
+        source = result.stdout
+        error = result.stderr
+    elif engine in ("uncompyle6", "decompyle3"):
+        if not importlib.util.find_spec(engine):
+            return {"error": f"{engine} is not installed; pip install {engine}"}
+        try:
+            result = _run_module_python_decompiler(engine, str(target))
+        except subprocess.TimeoutExpired:
+            return {"error": f"{engine} did not finish within 600s"}
+        source = result.stdout
+        error = result.stderr
+    else:
+        return {"error": f"unknown engine {engine!r}; use auto/pycdc/uncompyle6/decompyle3"}
+
+    if not source.strip() and error:
+        return {"error": f"{engine} failed: {error.strip()[-400:]}", "python_version": info.get("python_version"), "elapsed": round(time.time() - started, 1)}
+    return {
+        "decompiled": True,
+        "engine": engine,
+        "python_version": info.get("python_version"),
+        "magic": info.get("magic"),
+        "lines": len(source.splitlines()),
+        "source": source,
+        "had_stderr": bool(error),
+        "elapsed": round(time.time() - started, 1),
+    }
+
+
+def pycdas_disasm(path: str) -> dict[str, Any]:
+    """Disassemble a .pyc's bytecode with pycdas (low-level instruction listing)."""
+    ready = ensure_pycdc()
+    if not ready.get("ready"):
+        return ready
+    target = Path(path)
+    if not target.is_file():
+        return {"error": f"no such file: {target}"}
+    pycdas = _pycdc_dir().rglob("pycdas.exe")
+    exe = next((p for p in pycdas), None)
+    if exe is None:
+        return {"error": "pycdas.exe not present in the pycdc build; only pycdc.exe was found"}
+    try:
+        result = subprocess.run([str(exe), str(target)], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=600, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return {"error": "pycdas did not finish within 600s"}
+    if result.returncode != 0:
+        return {"error": (result.stderr or result.stdout)[-400:]}
+    return {"disassembly": result.stdout, "lines": len(result.stdout.splitlines())}

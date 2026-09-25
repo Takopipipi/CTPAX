@@ -8,15 +8,31 @@ from ghidra_mcp.runtime import fail, ghidra, mcp, render
 
 
 @mcp.tool()
-def decompile_java(path: str, extra_args: str = "") -> str:
-    """Decompile a Java jar/class to (nearly) original Java source with CFR.
+def decompile_java(path: str, engine: str = "cfr", extra_args: str = "") -> str:
+    """Decompile a Java jar/class to (nearly) original Java source.
 
-    CFR reconstructs control flow, generics and lambdas; most valid jars decompile
-    outright. Downloads CFR once automatically; needs java on PATH or JAVA_HOME.
-    The result lists per-class .java files ready to read with file tools.
+    Engines: ``cfr`` (default - best generics/control-flow recovery), ``procyon``
+    (aggressive at switch/closure reconstruction), ``jd`` (jd-cli, fastest). Each is
+    a single jar downloaded on first use. The result lists per-class .java files ready
+    to read with file tools. Needs java on PATH or JAVA_HOME.
     """
     try:
-        return render(lang_recover.decompile_java(path, extra_args=extra_args))
+        return render(lang_recover.decompile_java(path, engine=engine, extra_args=extra_args))
+    except Exception as exc:
+        return fail(exc)
+
+
+@mcp.tool()
+def decompile_java_status(engine: str | None = None) -> str:
+    """Are the JVM decompiler engines (cfr/procyon/jd) downloaded and runnable?
+
+    Pass one engine to check just it; omit to check all. Download happens
+    automatically the first time that engine is used.
+    """
+    try:
+        if engine:
+            return render(lang_recover.java_engine_status(engine))
+        return render({name: lang_recover.java_engine_status(name) for name in ("cfr", "procyon", "jd")})
     except Exception as exc:
         return fail(exc)
 
@@ -85,5 +101,44 @@ def find_crypto_constants(program: str | None = None, limit: int = 60) -> str:
     """
     try:
         return ghidra("find_crypto_constants", {"program": program, "limit": limit})
+    except Exception as exc:
+        return fail(exc)
+
+
+@mcp.tool()
+def pyc_info(path: str) -> str:
+    """Read a .pyc's header: magic, target Python version, mtime, optional size.
+
+    The bytecode's CPython version drives which decompiler is most likely to succeed.
+    """
+    try:
+        return render(lang_recover.pyc_info(path))
+    except Exception as exc:
+        return fail(exc)
+
+
+@mcp.tool()
+def decompile_python(path: str, engine: str = "auto") -> str:
+    """Decompile a .pyc to Python source.
+
+    Engine ``auto`` picks by the bytecode's magic: uncompyle6/decompyle3 for 2.7-3.8,
+    pycdc for 3.9+ (with fallbacks). Force pycdc/uncompyle6/decompyle3 to override.
+    The pycdc Windows build downloads automatically on first use.
+    """
+    try:
+        return render(lang_recover.decompile_python(path, engine=engine))
+    except Exception as exc:
+        return fail(exc)
+
+
+@mcp.tool()
+def pycdas_disasm(path: str) -> str:
+    """Disassemble a .pyc's bytecode with pycdas - the raw instruction listing.
+
+    Lower level than a decompiler: shows the actual POP_JUMP_IF_TRUE / LOAD_FAST /
+    CALL_FUNCTION stream, useful when a decompiler bails.
+    """
+    try:
+        return render(lang_recover.pycdas_disasm(path))
     except Exception as exc:
         return fail(exc)

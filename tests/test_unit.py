@@ -5,6 +5,7 @@ Run: python tests\\test_unit.py   (no pytest needed; prints PASS/FAIL and exits 
 
 import json
 import os
+import struct
 import sys
 import tempfile
 import time
@@ -613,6 +614,123 @@ class TestVersion(unittest.TestCase):
                 os.environ["GHIDRA_MCP_HOME"] = saved_home
             else:
                 del os.environ["GHIDRA_MCP_HOME"]
+
+
+class TestPycInfo(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _write_pyc(self, magic: int, version_parts: tuple[int, ...]) -> str:
+        magic_u32 = 0x0A0D0000 | magic  # on-disk magics carry the 0x0a0d\r\n tag in the high half
+        header = bytearray()
+        if version_parts[0] >= 3 and version_parts[1] >= 8:
+            header += struct.pack("<IHHI", magic_u32, 0, 0, 0)  # magic(4) flags(2) pad(2) mtime(4)
+            header += struct.pack("<I", 123)  # source size
+        elif (3, 7) <= version_parts[:2] < (3, 8):
+            header += struct.pack("<IHI", magic_u32, 0, 0)  # magic(4) flags(2) mtime(4)
+        else:
+            header += struct.pack("<II", magic_u32, 0)  # magic(4) mtime(4)
+        pyc = self.tmp.name + os.sep + f"v{version_parts[0]}{version_parts[1]}.pyc"
+        with open(pyc, "wb") as fh:
+            fh.write(bytes(header))
+            fh.write(b"\x00" * 64)
+        return pyc
+
+    def test_magic_311(self):
+        pyc = self._write_pyc(3495, (3, 11))
+        result = lang_recover.pyc_info(pyc)
+        self.assertEqual(result["python_version"], "3.11")
+        self.assertEqual(result["header_bytes"], 16)
+
+    def test_magic_36_short_header(self):
+        pyc = self._write_pyc(3379, (3, 6))
+        result = lang_recover.pyc_info(pyc)
+        self.assertEqual(result["python_version"], "3.6")
+        self.assertEqual(result["header_bytes"], 8)
+
+    def test_unknown_magic_reports_unknown_not_crash(self):
+        pyc = self._write_pyc(9999, (9, 9))
+        result = lang_recover.pyc_info(pyc)
+        self.assertIn("python_version", result)
+        self.assertNotIn("error", result)
+
+    def test_garbage_file_is_rejected(self):
+        bad = self.tmp.name + os.sep + "junk.bin"
+        with open(bad, "wb") as fh:
+            fh.write(b"junk")
+        result = lang_recover.pyc_info(bad)
+        self.assertIn("error", result)
+
+    def test_roundtrip_compile(self):
+        source = self.tmp.name + os.sep + "sample.py"
+        with open(source, "w", encoding="utf-8") as fh:
+            fh.write("def f(x):\n    return x * 2\n")
+        import py_compile
+
+        pyc = py_compile.compile(source, cfile=self.tmp.name + os.sep + "sample.pyc", doraise=True)
+        result = lang_recover.pyc_info(pyc)
+        self.assertTrue(result["python_version"].startswith("3"))
+
+
+class TestPythonEnginePick(unittest.TestCase):
+    def test_modern_version_prefers_pycdc(self):
+        self.assertEqual(lang_recover._pick_python_engine(3, 11, True, True, True), "pycdc")
+        self.assertEqual(lang_recover._pick_python_engine(3, 11, False, True, True), "uncompyle6")
+
+    def test_old_version_prefers_uncompyle6(self):
+        self.assertEqual(lang_recover._pick_python_engine(3, 7, True, True, True), "uncompyle6")
+        self.assertEqual(lang_recover._pick_python_engine(3, 7, True, False, True), "decompyle3")
+
+    def test_none_when_everything_missing(self):
+        self.assertIsNone(lang_recover._pick_python_engine(3, 11, False, False, False))
+
+    def test_pyc_route_is_last_resort(self):
+        self.assertEqual(lang_recover._pick_python_engine(3, 11, True, False, False), "pycdc")
+
+
+class TestManagedTools(unittest.TestCase):
+    def test_status_shape_without_external_tools(self):
+        from ghidra_mcp import managed
+
+        status = managed.managed_status()
+        for key in ("binary_ninja", "ilspycmd", "dnspy", "dotpeek", "megadumper", "frida"):
+            self.assertIn(key, status)
+        # frida is not installed in the test env: must degrade cleanly, never raise
+        self.assertIn("available", status["frida"])
+
+    def test_binaryninja_status_never_raises(self):
+        from ghidra_mcp import managed
+
+        result = managed.binaryninja_status()
+        self.assertIn("found", result)
+
+    def test_java_engine_status_known_and_unknown(self):
+        info = lang_recover.java_engine_status("cfr")
+        self.assertIn("jar", info)
+        bad = lang_recover.java_engine_status("nope")
+        self.assertIn("error", bad)
+
+    def test_tool_modules_import_and_register(self):
+        from ghidra_mcp import tools_frida, tools_managed  # noqa: F401
+
+        self.assertTrue(callable(tools_frida.frida_attach))
+        self.assertTrue(callable(tools_frida.frida_hook))
+        self.assertTrue(callable(tools_managed.binaryninja_open))
+        self.assertTrue(callable(tools_managed.binaryninja_decompile))
+        self.assertTrue(callable(tools_managed.dotnet_decompile))
+        self.assertTrue(callable(tools_managed.dnspy_open))
+        self.assertTrue(callable(tools_managed.dotpeek_open))
+        self.assertTrue(callable(tools_managed.mega_dump))
+        self.assertTrue(callable(tools_managed.managed_status))
+
+    def test_frida_status_when_missing(self):
+        from ghidra_mcp import frida_mcp
+
+        result = frida_mcp.status()
+        self.assertIn("available", result)
+        if not result.get("available"):
+            self.assertIn("hint", result)
 
 
 if __name__ == "__main__":

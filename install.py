@@ -58,6 +58,12 @@ REQUIREMENTS = [
     "dnfile==0.17.0",
     "dncil==1.0.2",
     "msgpack==1.2.2",
+    # Runtime hooking and Python bytecode decompilation. frida is unpinned on purpose:
+    # its wheel availability varies with the target's Python version (3.13 needs >= 17.1),
+    # and a hard pin would leave older installs unfixable.
+    "frida>=17.1",
+    "uncompyle6",
+    "decompyle3",
 ]
 REQUIREMENTS_NO_DEPS = ["pyghidra==3.1.0"]
 REQUIREMENTS_PINNED = ["JPype1==1.5.2", "packaging"]
@@ -1845,6 +1851,96 @@ def _install_templates_from_tarball(destination: Path) -> bool:
         return False
 
 
+def install_managed_tools(offline: bool = False, home: Path | None = None) -> bool:
+    """Pre-download the on-demand third-party tools so first use is instant.
+
+    Every tool here self-installs at first use too (see managed.py / lang_recover.py);
+    this step just warms them. Nothing here is fatal: a download failure is a warning,
+    and the relevant MCP tool will report a clean error with the fix.
+    """
+    if offline:
+        out.info("offline mode: skipping predownload of managed reversing tools")
+        return True
+    try:
+        from ghidra_mcp import lang_recover, managed
+    except Exception as exc:
+        out.warn(f"managed tool installer not importable: {exc}")
+        return False
+
+    ok = True
+
+    out.step("Predownloading JVM decompiler engines (cfr/procyon/jd)")
+    for engine in ("cfr", "procyon", "jd"):
+        try:
+            result = lang_recover._ensure_engine(engine)
+            if result.get("ready"):
+                out.ok(f"{engine}: {Path(result['jar']).name}")
+            else:
+                out.warn(f"{engine}: {result.get('error') or 'unavailable'}")
+                ok = False
+        except Exception as exc:
+            out.warn(f"{engine}: {exc}")
+            ok = False
+
+    out.step("Predownloading pycdc (Python bytecode decompiler, Windows build)")
+    try:
+        result = lang_recover.ensure_pycdc()
+        if result.get("ready"):
+            out.ok(f"pycdc: {Path(result['exe']).name}")
+        else:
+            out.warn(f"pycdc: {result.get('error')} (uncompyle6/decompyle3 are pip-installed already)")
+            ok = False
+    except Exception as exc:
+        out.warn(f"pycdc: {exc}")
+        ok = False
+
+    out.step("Installing ilspycmd (.NET decompiler via dotnet tool)")
+    try:
+        result = managed.ensure_ilspycmd()
+        if result.get("ready"):
+            out.ok(f"ilspycmd: {result.get('path')}")
+        else:
+            out.warn(f"ilspycmd: {result.get('error') or result.get('hint')}")
+            ok = False
+    except Exception as exc:
+        out.warn(f"ilspycmd: {exc}")
+        ok = False
+
+    out.step("Predownloading dnSpy (GUI .NET decompiler/debugger)")
+    try:
+        result = managed.ensure_dnspy()
+        if result.get("ready"):
+            out.ok(f"dnSpy: {result.get('exe')}")
+        else:
+            out.warn(f"dnSpy: {result.get('error')}")
+            ok = False
+    except Exception as exc:
+        out.warn(f"dnSpy: {exc}")
+        ok = False
+
+    out.step("Predownloading MegaDumper (process image dumper)")
+    try:
+        result = managed.ensure_megadumper()
+        if result.get("ready"):
+            out.ok(f"MegaDumper: {result.get('exe')}")
+        else:
+            out.warn(f"MegaDumper: {result.get('error')}")
+            ok = False
+    except Exception as exc:
+        out.warn(f"MegaDumper: {exc}")
+        ok = False
+
+    out.step("Checking the Frida runtime")
+    try:
+        result = managed.managed_status()
+        frida = (result.get("frida") or {}).get("available")
+        out.ok("frida runtime ready") if frida else out.warn("frida not importable (pip install frida)")
+        ok = ok and bool(frida)
+    except Exception as exc:
+        out.warn(f"frida check: {exc}")
+    return ok
+
+
 PROGRESS: "Callable[[str, float], None] | None" = None
 
 
@@ -1901,6 +1997,8 @@ def do_install(arguments: argparse.Namespace) -> int:
     _tick("nuclei step done", 0.7)
     install_wireshark(offline=arguments.offline)
     _tick("wireshark step done", 0.74)
+    install_managed_tools(offline=arguments.offline, home=home)
+    _tick("managed tools step done", 0.78)
 
     if arguments.skip_verify:
         out.warn("skipping verification at your request")

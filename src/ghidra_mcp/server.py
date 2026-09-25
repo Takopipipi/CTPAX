@@ -31,6 +31,8 @@ from ghidra_mcp import tools_ghidra  # noqa: F401
 from ghidra_mcp import tools_pentest  # noqa: F401
 from ghidra_mcp import tools_nuclei  # noqa: F401
 from ghidra_mcp import tools_version  # noqa: F401
+from ghidra_mcp import tools_managed  # noqa: F401
+from ghidra_mcp import tools_frida  # noqa: F401
 
 
 def main() -> None:

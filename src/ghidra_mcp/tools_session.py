@@ -46,6 +46,35 @@ def doctor() -> str:
             libraries[name] = {"available": False, "for": purpose, "install": f"pip install {name}"}
     report["python_libraries"] = libraries
     report["python"] = {"executable": sys.executable, "version": sys.version.split()[0]}
+
+    from ghidra_mcp import frida_mcp, managed
+
+    managed_report: dict[str, Any] = {}
+    try:
+        managed_report["binary_ninja"] = managed.binaryninja_status()
+    except Exception as exc:
+        managed_report["binary_ninja"] = {"error": str(exc)}
+    try:
+        managed_report["frida"] = frida_mcp.status()
+    except Exception as exc:
+        managed_report["frida"] = {"error": str(exc)}
+    try:
+        from ghidra_mcp import lang_recover
+
+        managed_report["python_decompilers"] = lang_recover.python_decompiler_status()
+        managed_report["jvm_engines"] = {name: lang_recover.java_engine_status(name).get("ready", False) for name in ("cfr", "procyon", "jd")}
+    except Exception as exc:
+        managed_report["decompilers"] = {"error": str(exc)}
+    try:
+        from ghidra_mcp import managed as managed_module
+
+        managed_report["dnspy"] = {"ready": (managed_module._dnspy_dir() / "dnSpy.exe").is_file()}
+        managed_report["megadumper"] = {"ready": managed_module._megadumper_exe().is_file()}
+        ilspy = managed_module._ilspycmd()
+        managed_report["ilspycmd"] = {"ready": ilspy.get("found", False)}
+    except Exception as exc:
+        managed_report["managed_gui"] = {"error": str(exc)}
+    report["managed_tools"] = managed_report
     report["worker"] = WORKER.describe()
 
     from ghidra_mcp import version as version_module
