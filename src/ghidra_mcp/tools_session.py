@@ -74,6 +74,12 @@ def doctor() -> str:
         managed_report["ilspycmd"] = {"ready": ilspy.get("found", False)}
     except Exception as exc:
         managed_report["managed_gui"] = {"error": str(exc)}
+    try:
+        from ghidra_mcp import httpdbg_mcp
+
+        managed_report["http_debugger"] = httpdbg_mcp.status()
+    except Exception as exc:
+        managed_report["http_debugger"] = {"error": str(exc)}
     report["managed_tools"] = managed_report
     report["worker"] = WORKER.describe()
 

@@ -579,8 +579,15 @@ def managed_status() -> dict[str, Any]:
             frida = frida_mcp.status() | {"available": not frida_mcp.status().get("missing")}
         except Exception:
             pass
+    try:
+        from ghidra_mcp import httpdbg_mcp
+
+        http_debugger = httpdbg_mcp.status()
+    except Exception as exc:
+        http_debugger = {"error": str(exc)}
     return {
         "binary_ninja": binaryninja_status(),
+        "http_debugger": http_debugger,
         "ilspycmd": {"ready": _ilspycmd()["found"]},
         "dnspy": {"ready": _dnspy_dir().joinpath("dnSpy.exe").is_file()},
         "dotpeek": _find_dotpeek(),
