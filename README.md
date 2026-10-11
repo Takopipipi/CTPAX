@@ -36,8 +36,10 @@ downloaded into the toolkit folder automatically:
 - **Nuclei** + its ~13k template repo, **Wireshark** CLI tools (winget)
 - venv + Python dependencies for the server itself
 
-At the end it registers the MCP server into every AI client it finds on the machine:
-OpenCode, Cursor, Claude Code, Codex. Re-running is safe - it updates in place.
+At the end it verifies the install by actually starting the MCP server (`doctor`),
+prints the summary, waits for Enter, and registers the MCP server into every AI client
+it finds on the machine: OpenCode, Cursor, Claude Code, Codex, Claude Desktop,
+Cline (VS Code). Re-running is safe - it updates in place.
 
 ```
 CTPAX.bat                 <- install into the biggest drive, register all detected clients
@@ -45,6 +47,8 @@ CTPAX.bat --check         <- show the plan (drives + target paths), install noth
 CTPAX.bat --engine-only   <- self-test: lay the sources down and load the engine, stop
 CTPAX.bat --offline       <- skip all downloads
 ```
+
+Windows SmartScreen may warn about the unsigned `CTPAX-Setup.exe`: "More info" -> "Run anyway".
 
 ### install.bat - the classic path
 
@@ -58,8 +62,8 @@ installs dependencies, copies the server there, **starts it and verifies via its
 Comments and formatting of your config are preserved; a timestamped backup is placed next
 to it.
 
-To register other clients, add `--cursor`, `--claude`, `--codex` (or `--all-clients` to
-auto-detect and register each one found):
+To register other clients, add `--cursor`, `--claude`, `--codex`, `--claude-desktop`,
+`--cline` (or `--all-clients` to auto-detect and register each one found):
 
 ```
 install.bat --all-clients
@@ -68,6 +72,8 @@ install.bat --all-clients
 - Cursor: writes `mcpServers.ghidra` into the global `~/.cursor/mcp.json`
 - Claude Code: writes `mcpServers.ghidra` into `~/.claude.json` (user scope)
 - Codex: writes the `[mcp_servers.ghidra]` block into `~/.codex/config.toml`
+- Claude Desktop: writes `mcpServers.ghidra` into `%APPDATA%\Claude\claude_desktop_config.json`
+- Cline (VS Code): writes `mcpServers.ghidra` into Cline's `cline_mcp_settings.json`
 
 Then restart the clients.
 
@@ -86,6 +92,18 @@ uninstall.bat --cursor                        also remove the Cursor entry
 
 Requirements: Python 3.10+, unpacked Ghidra 11+, JDK 21+ (JDK, not JRE -- need `jvm.dll`).
 Ghidra: https://ghidra-sre.org, JDK: https://adoptium.net.
+
+### Building CTPAX-Setup.exe
+
+```
+pip install pyinstaller certifi
+python build_release.py
+```
+
+The script packs the project into `build\CTPAX-project.zip`, freezes `ctpax_setup.py`
+into `dist\CTPAX-Setup.exe` with the zip embedded (plus every stdlib module the engine
+imports dynamically), so the single exe carries the whole installer inside itself.
+Verify a build with `CTPAX-Setup.exe --selftest`.
 
 ### One path limitation
 

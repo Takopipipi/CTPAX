@@ -11,6 +11,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -731,6 +732,405 @@ class TestManagedTools(unittest.TestCase):
         self.assertIn("available", result)
         if not result.get("available"):
             self.assertIn("hint", result)
+
+
+class TestHttpdbgMcp(unittest.TestCase):
+    """HTTP Debugger integration: tool registration, install detection, bridge protocol."""
+
+    def tearDown(self):
+        from ghidra_mcp import httpdbg_mcp
+
+        httpdbg_mcp.stop_session()
+
+    def _spawn_fake(self, script_body: str) -> dict:
+        from ghidra_mcp import httpdbg_mcp
+
+        folder = tempfile.mkdtemp()
+        script = Path(folder) / "fake_bridge.py"
+        script.write_text(script_body, encoding="utf-8")
+        httpdbg_mcp.stop_session()
+        return httpdbg_mcp._spawn_bridge(timeout=5, command=[sys.executable, str(script)])
+
+    def test_all_official_bridge_tools_registered_under_real_names(self):
+        import asyncio
+
+        from ghidra_mcp import httpdbg_mcp, tools_httpdbg  # noqa: F401  (registers its tools)
+        from ghidra_mcp.runtime import mcp
+
+        names = {tool.name for tool in asyncio.run(mcp.list_tools())}
+        expected = {f"httpdbg_mcp_{name}" for name in httpdbg_mcp._MCP_TOOLS}
+        self.assertTrue(expected <= names, f"missing from the registry: {sorted(expected - names)}")
+        self.assertNotIn("_wrapped", names, "the wrappers collapsed into one registration")
+        for extra in ("httpdbg_status", "httpdbg_mcp_get_session", "httpdbg_mcp_call",
+                      "httpdbg_mcp_list_tools", "httpdbg_mcp_stop_session"):
+            self.assertIn(extra, names)
+
+    def test_status_without_install_says_where_to_get_it(self):
+        from ghidra_mcp import httpdbg_mcp
+
+        empty = Path(tempfile.mkdtemp())
+        with mock.patch.object(httpdbg_mcp, "_install_candidates", return_value=[empty]):
+            status = httpdbg_mcp.status()
+        self.assertFalse(status["installed"])
+        self.assertIn("httpdebugger.com", status["note"])
+        self.assertFalse(status["bridge_session"]["connected"])
+
+    def test_call_without_session_reports_how_to_connect(self):
+        from ghidra_mcp import httpdbg_mcp
+
+        saved = dict(httpdbg_mcp._BRIDGE)
+        httpdbg_mcp._BRIDGE.clear()
+        try:
+            self.assertIn("error", httpdbg_mcp.call("list_transactions"))
+            self.assertIn("error", httpdbg_mcp.list_tools())
+        finally:
+            httpdbg_mcp._BRIDGE.clear()
+            httpdbg_mcp._BRIDGE.update(saved)
+
+    def test_mcp_handshake_discovery_and_full_passthrough(self):
+        from ghidra_mcp import httpdbg_mcp
+
+        info = self._spawn_fake(_FAKE_MCP_BRIDGE)
+        self.assertTrue(info.get("started"), info)
+        self.assertEqual(info.get("handshake"), "mcp")
+
+        listed = httpdbg_mcp.list_tools()
+        self.assertEqual(listed.get("count"), 2, listed)
+        names = {tool["name"] for tool in listed["tools"]}
+        self.assertIn("brand_new_tool", names)
+        page_param = next(t for t in listed["tools"] if t["name"] == "list_transactions")
+        self.assertEqual(page_param["parameters"]["page"]["type"], "integer")
+
+        # documented tool: documented defaults merged with the caller's params
+        result = httpdbg_mcp.call("list_transactions", {"page": 1})
+        self.assertEqual(result.get("called"), "list_transactions")
+        self.assertEqual(result["arguments"].get("page"), 1)
+        self.assertIn("session_id", result["arguments"])
+
+        # anything the bridge exposes, even outside the documented 8
+        result = httpdbg_mcp.call("brand_new_tool", {"x": True})
+        self.assertEqual(result.get("called"), "brand_new_tool")
+        self.assertEqual(result.get("arguments"), {"x": True})
+
+    def test_get_session_reuses_running_bridge_and_lists_full_toolset(self):
+        from ghidra_mcp import httpdbg_mcp
+
+        self._spawn_fake(_FAKE_MCP_BRIDGE)
+        session = httpdbg_mcp.get_session()
+        self.assertTrue(session.get("connected"), session)
+        self.assertEqual(session.get("protocol"), "mcp")
+        self.assertIn("brand_new_tool", session.get("tools") or [])
+        self.assertEqual(session.get("tool_count"), 2)
+
+    def test_legacy_bridge_falls_back_to_raw_methods(self):
+        from ghidra_mcp import httpdbg_mcp
+
+        info = self._spawn_fake(_FAKE_LEGACY_BRIDGE)
+        self.assertEqual(info.get("handshake"), "legacy", info)
+        result = httpdbg_mcp.call("list_transactions", {"page": 2})
+        self.assertTrue(result.get("legacy"), result)
+        self.assertEqual(result["params"].get("page"), 2)
+        self.assertEqual(result["params"].get("session_id"), None)
+
+    def test_hung_bridge_times_out_instead_of_blocking_server(self):
+        from ghidra_mcp import httpdbg_mcp
+
+        info = self._spawn_fake(_FAKE_SILENT_BRIDGE)
+        self.assertEqual(info.get("handshake"), "mcp", info)
+        started = time.time()
+        result = httpdbg_mcp.call("list_transactions", timeout=1.0)
+        elapsed = time.time() - started
+        self.assertLess(elapsed, 5.0, "the call blocked instead of timing out")
+        self.assertIn("timeout", str(result.get("error", "")), result)
+
+    def test_stop_session_is_idempotent(self):
+        from ghidra_mcp import httpdbg_mcp
+
+        self.assertFalse(httpdbg_mcp.stop_session().get("stopped"))
+        self._spawn_fake(_FAKE_MCP_BRIDGE)
+        self.assertTrue(httpdbg_mcp.stop_session().get("stopped"))
+        self.assertFalse(httpdbg_mcp.stop_session().get("stopped"))
+
+
+class TestCheatEngine(unittest.TestCase):
+    """Cheat Engine integration: detection, autorun bridge, mailbox protocol, sugar."""
+
+    def tearDown(self):
+        from ghidra_mcp import ce_mcp
+
+        ce_mcp._CE_LOCK.release() if ce_mcp._CE_LOCK.locked() else None
+
+    def _patched(self, state: Path, exe_dir: Path | None):
+        """Contexts patching the state dir and (optionally) the CE install location."""
+        from ghidra_mcp import ce_mcp
+
+        env = mock.patch.dict(os.environ, {"CTPAX_CE_STATE_DIR": str(state)})
+        if exe_dir is None:
+            finder = mock.patch.object(ce_mcp, "_find_exe", return_value=None)
+        else:
+            exe = exe_dir / "Cheat Engine.exe"
+            finder = mock.patch.object(ce_mcp, "_find_exe", return_value=exe)
+        return env, finder
+
+    @staticmethod
+    def _fake_bridge(state: Path, payload: dict, *, stop_after: int = 1):
+        """A thread that plays the CE side: read request.lua, write the response."""
+        import threading as th
+
+        request = state / "request.lua"
+
+        def run():
+            served = 0
+            for _ in range(200):  # up to 10s
+                if request.exists():
+                    try:
+                        text = request.read_text(encoding="utf-8")
+                    except OSError:
+                        time.sleep(0.05)
+                        continue
+                    request.unlink(missing_ok=True)
+                    nonce = text.split("ctpax-nonce:", 1)[1].splitlines()[0].strip()
+                    (state / f"response_{nonce}.json").write_text(json.dumps(payload), encoding="utf-8")
+                    served += 1
+                    if served >= stop_after:
+                        return
+                time.sleep(0.05)
+
+        thread = th.Thread(target=run, daemon=True)
+        thread.start()
+        return thread
+
+    def test_tools_registered(self):
+        import asyncio
+
+        from ghidra_mcp import tools_ce  # noqa: F401  (registers its tools)
+        from ghidra_mcp.runtime import mcp
+
+        names = {tool.name for tool in asyncio.run(mcp.list_tools())}
+        expected = {
+            "ce_status", "ce_launch", "ce_bridge_install", "ce_bridge_status",
+            "ce_lua", "ce_attach", "ce_read", "ce_write", "ce_assemble", "ce_focus",
+        }
+        self.assertTrue(expected <= names, f"missing: {sorted(expected - names)}")
+
+    def test_status_without_install_says_where_to_get_it(self):
+        from ghidra_mcp import ce_mcp
+
+        state = Path(tempfile.mkdtemp())
+        env, finder = self._patched(state, None)
+        with env, finder:
+            status = ce_mcp.status()
+        self.assertFalse(status["installed"])
+        self.assertIn("cheatengine.org", status["note"])
+
+    def test_bridge_install_writes_autorun_script_and_is_idempotent(self):
+        from ghidra_mcp import ce_mcp
+
+        state = Path(tempfile.mkdtemp())
+        exe_dir = Path(tempfile.mkdtemp())
+        env, finder = self._patched(state, exe_dir)
+        with env, finder:
+            first = ce_mcp.bridge_install()
+            second = ce_mcp.bridge_install()
+        self.assertTrue(first.get("installed"), first)
+        self.assertTrue(first.get("changed"), first)
+        self.assertFalse(second.get("changed"), second)
+        script = exe_dir / "autorun" / ce_mcp._BRIDGE_FILENAME
+        self.assertTrue(script.is_file())
+        text = script.read_text(encoding="utf-8")
+        self.assertIn("createTimer", text)
+        self.assertIn("request.lua", text)
+        self.assertIn("openProcess", text)
+        self.assertNotIn(text.encode("ascii", "strict").decode("ascii"), "")  # pure ASCII
+
+    def test_bridge_install_without_ce_errors(self):
+        from ghidra_mcp import ce_mcp
+
+        env, finder = self._patched(Path(tempfile.mkdtemp()), None)
+        with env, finder:
+            result = ce_mcp.bridge_install()
+        self.assertIn("error", result)
+
+    def test_lua_without_heartbeat_fails_fast_with_hint(self):
+        from ghidra_mcp import ce_mcp
+
+        state = Path(tempfile.mkdtemp())
+        env, _ = self._patched(state, None)
+        with env:
+            started = time.time()
+            result = ce_mcp.lua("return 1", timeout=5)
+        self.assertLess(time.time() - started, 2.0, "should not wait when the bridge is absent")
+        self.assertIn("error", result)
+        self.assertIn("ce_bridge_install", str(result.get("hint", "")))
+
+    def test_lua_roundtrip_through_fake_bridge(self):
+        from ghidra_mcp import ce_mcp
+
+        state = Path(tempfile.mkdtemp())
+        state.mkdir(exist_ok=True)
+        (state / "heartbeat").write_text(str(int(time.time())), encoding="utf-8")
+        env, _ = self._patched(state, None)
+        payload = {"ok": True, "result": {"hp": 100, "flags": [1, 0, 1]}}
+        with env:
+            thread = self._fake_bridge(state, payload)
+            result = ce_mcp.lua("return {hp=100}", timeout=5)
+            thread.join(5)
+        self.assertEqual(result, {"ok": True, "result": payload["result"]})
+
+    def test_lua_surfaces_bridge_errors(self):
+        from ghidra_mcp import ce_mcp
+
+        state = Path(tempfile.mkdtemp())
+        (state / "heartbeat").write_text(str(int(time.time())), encoding="utf-8")
+        env, _ = self._patched(state, None)
+        with env:
+            thread = self._fake_bridge(state, {"ok": False, "error": "attempt to index nil"})
+            result = ce_mcp.lua("return nil", timeout=5)
+            thread.join(5)
+        self.assertIn("error", result)
+        self.assertIn("attempt to index nil", result["error"])
+
+    def test_lua_timeout_is_fast_and_cleans_up(self):
+        from ghidra_mcp import ce_mcp
+
+        state = Path(tempfile.mkdtemp())
+        (state / "heartbeat").write_text(str(int(time.time())), encoding="utf-8")
+        env, _ = self._patched(state, None)
+        with env:
+            started = time.time()
+            result = ce_mcp.lua("return 1", timeout=1.0)
+            elapsed = time.time() - started
+        self.assertLess(elapsed, 5.0, "timeout must not hang the server")
+        self.assertIn("timeout", str(result.get("error", "")))
+        self.assertFalse((state / "request.lua").exists(), "stale request left behind")
+
+    def test_sugar_tools_build_expected_ce_lua(self):
+        from ghidra_mcp import ce_mcp
+
+        captured: list[str] = []
+
+        def fake_lua(script, **kwargs):
+            captured.append(script)
+            return {"ok": True, "result": None}
+
+        with mock.patch.object(ce_mcp, "lua", side_effect=fake_lua):
+            ce_mcp.attach("game.exe")
+            ce_mcp.read("game.exe+100", 4)
+            ce_mcp.write("0x1234", "90 90 CC")
+            ce_mcp.assemble("nop")
+        self.assertEqual(captured[0], 'return openProcess("game.exe")')
+        self.assertEqual(captured[1], 'return readBytes("game.exe+100", 4, true)')
+        self.assertEqual(captured[2], "return writeBytes(4660, 144,144,204)")
+        self.assertEqual(captured[3], 'return autoAssemble("nop")')
+
+    def test_write_rejects_non_hex_payload(self):
+        from ghidra_mcp import ce_mcp
+
+        self.assertIn("error", ce_mcp.write("0x1234", "zz"))
+        self.assertIn("error", ce_mcp.write("0x1234", "9"))  # odd nibble
+
+    def test_lua_quote_and_arg(self):
+        from ghidra_mcp import ce_mcp
+
+        self.assertEqual(ce_mcp._lua_quote('a"b\\c\nd'), '"a\\"b\\\\c\\nd"')
+        self.assertEqual(ce_mcp._lua_arg(42), "42")
+        self.assertEqual(ce_mcp._lua_arg("12345"), "12345")
+        self.assertEqual(ce_mcp._lua_arg("notepad.exe"), '"notepad.exe"')
+        # addresses: 0x becomes a Lua number, everything else stays CE's own syntax
+        self.assertEqual(ce_mcp._lua_address("0x1234"), "4660")
+        self.assertEqual(ce_mcp._lua_address("00400000"), '"00400000"')
+        self.assertEqual(ce_mcp._lua_address("game.exe+100"), '"game.exe+100"')
+        self.assertEqual(ce_mcp._lua_address(4660), "4660")
+
+
+# A minimal MCP bridge over stdio: it answers initialize, tools/list and
+# tools/call - the protocol HTTPDebuggerMcp.exe speaks.
+_FAKE_MCP_BRIDGE = r'''
+import json, sys
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    mid = msg.get("id")
+    method = msg.get("method") or ""
+    if mid is None:
+        continue  # notification
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "fake-httpdbg", "version": "0"}}})
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": mid, "result": {"tools": [
+            {"name": "list_transactions", "description": "captured transactions",
+             "inputSchema": {"type": "object",
+                             "properties": {"page": {"type": "integer", "description": "page index"}},
+                             "required": []}},
+            {"name": "brand_new_tool", "description": "not one of the documented 8",
+             "inputSchema": {"type": "object", "properties": {}}}]}})
+    elif method == "tools/call":
+        params = msg.get("params") or {}
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "content": [{"type": "text", "text": json.dumps(
+                {"called": params.get("name"), "arguments": params.get("arguments")})}],
+            "isError": False}})
+    else:
+        send({"jsonrpc": "2.0", "id": mid,
+              "error": {"code": -32601, "message": "Method not found"}})
+'''
+
+# A bridge that refuses the MCP handshake but answers the legacy raw methods.
+_FAKE_LEGACY_BRIDGE = r'''
+import json, sys
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    mid = msg.get("id")
+    method = msg.get("method") or ""
+    if mid is None:
+        continue
+    if method == "list_transactions" or method == "get_capture_status":
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "legacy": True, "method": method, "params": msg.get("params")}})
+    else:
+        send({"jsonrpc": "2.0", "id": mid,
+              "error": {"code": -32601, "message": "Method not found"}})
+'''
+
+# Completes the handshake, then never answers anything else.
+_FAKE_SILENT_BRIDGE = r'''
+import json, sys
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    mid = msg.get("id")
+    if mid is None:
+        continue
+    if msg.get("method") == "initialize":
+        send({"jsonrpc": "2.0", "id": mid, "result": {
+            "protocolVersion": "2024-11-05", "capabilities": {},
+            "serverInfo": {"name": "silent-httpdbg", "version": "0"}}})
+'''
 
 
 if __name__ == "__main__":

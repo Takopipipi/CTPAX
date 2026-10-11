@@ -153,10 +153,12 @@ def titanhide_status() -> str:
 def titanhide_hide(target_pid: int, options: list[str] | None = None, system_pid: int = 4) -> str:
     """Hide a PID behind TitanHide's kernel-level anti-anti-debug shields.
 
-    ``options`` defaults to all nine shields (HideNtQueryInformationProcess,
-    HideNtSetContextThread, HideNtGetContextThread, ...). Pass the debugger's PID as
-    ``system_pid`` (default 4 = System, hides from every process). Needs an elevated
-    session and the driver loaded.
+    ``options`` defaults to all ten shields (HideProcessDebugFlags,
+    HideProcessDebugPort, HideThreadHideFromDebugger, HideNtSetContextThread,
+    HideNtGetContextThread, ...). Needs an elevated session and the TitanHide
+    driver loaded. ``system_pid`` is accepted for compatibility but ignored: the
+    driver runs in System context and its HIDE_INFO request has no system-PID
+    field.
     """
     try:
         return render(dynamic.titanhide_hide(target_pid, options, system_pid=system_pid))

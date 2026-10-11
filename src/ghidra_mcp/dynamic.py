@@ -159,6 +159,9 @@ def _init_winapi() -> None:
     ]
     kernel32.DeviceIoControl.restype = wt.BOOL
 
+    kernel32.WriteFile.argtypes = [wt.HANDLE, ctypes.c_void_p, wt.DWORD, ctypes.POINTER(wt.DWORD), ctypes.c_void_p]
+    kernel32.WriteFile.restype = wt.BOOL
+
 
 _init_winapi()
 
@@ -643,58 +646,78 @@ def hwbp_list(pid: int) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
-# TitanHide client (DeviceIoControl on \\.\\TitanHide)
+# TitanHide client (WriteFile on \\.\TitanHide with a HIDE_INFO struct)
 # --------------------------------------------------------------------------
-_TITANHIDE_IOCTL_HIDE = (0x22 << 16) | (0x800 << 2) | 3  # CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_NEITHER, FILE_ANY_ACCESS)
-_TITANHIDE_IOCTL_UNHIDE = (0x22 << 16) | (0x801 << 2) | 3
+# The real TitanHide driver (mrexodia/TitanHide) does NOT speak IOCTL codes.
+# DriverEntry wires IRP_MJ_WRITE -> Hider::ProcessData; every other major
+# function (including IRP_MJ_DEVICE_CONTROL) falls through to
+# DriverDefaultHandler, which returns STATUS_NOT_SUPPORTED. STATUS_NOT_SUPPORTED
+# surfaces to Win32 as error 50 ("request not accomplished") - that is exactly
+# the IOCTL failure the MCP path was returning. The x64dbg TitanHide plugin
+# uses the WriteFile/HIDE_INFO protocol, which is the one that actually works.
+_TITAN_HIDE = 0
+_TITAN_UNHIDE = 1
+_TITAN_UNHIDE_ALL = 2
 
+# These map onto the driver's HIDE_TYPE enum by bit position (BIT(x) = 1<<(x-1)).
+# The numeric values are what the driver interprets; the names are the MCP labels.
 _TITANHIDE_OPTIONS = {
-    "HideSystemDebugger": 1,
-    "HideNtQueryInformationProcess": 2,
-    "HideNtSetInformationThread": 4,
-    "HideNtQueryObject": 8,
-    "HideNtQuerySystemInformation": 16,
-    "HideNtYieldExecution": 32,
-    "HideNtGetContextThread": 64,
-    "HideNtSetContextThread": 128,
-    "HideNtCreateThreadEx": 256,
+    "HideProcessDebugFlags": 1,
+    "HideProcessDebugPort": 2,
+    "HideProcessDebugObjectHandle": 4,
+    "HideDebugObject": 8,
+    "HideSystemDebuggerInformation": 16,
+    "HideNtClose": 32,
+    "HideThreadHideFromDebugger": 64,
+    "HideNtGetContextThread": 128,
+    "HideNtSetContextThread": 256,
+    "HideNtSystemDebugControl": 512,
 }
 
 
-class _TITANHIDE_REQUEST(ctypes.Structure):
+class _HIDE_INFO(ctypes.Structure):
     _fields_ = [
-        ("SystemPid", ctypes.c_uint32),
-        ("ProcessId", ctypes.c_uint32),
-        ("HideOptions", ctypes.c_uint32),
+        ("Command", ctypes.c_uint32),
+        ("Type", ctypes.c_uint32),
+        ("Pid", ctypes.c_uint32),
     ]
 
 
-def _titanhide_call(ioctl: int, system_pid: int, target_pid: int, options: int) -> dict[str, Any]:
-    """Send one HIDE/UNHIDE request; DeviceIoControl errors are reported verbatim."""
+def _titanhide_call(command: int, target_pid: int, hide_type: int, *, system_pid: int = 4) -> dict[str, Any]:
+    r"""Send one HIDE/UNHIDE request to the TitanHide driver via WriteFile.
+
+    Matches the x64dbg TitanHide plugin protocol: open \\.\TitanHide, write a
+    HIDE_INFO {Command, Type, Pid}, close. ``system_pid`` is accepted for API
+    compatibility with callers that used the (obsolete) IOCTL form, but is
+    ignored - the driver already runs in System context and has no per-call
+    system-PID field. DeviceIoControl is NOT used (the driver returns
+    STATUS_NOT_SUPPORTED / Win32 error 50 for it).
+    """
     enable_debug_privilege()
     handle, error = _open_device(r"\\.\TitanHide")
     if not handle:
         return {
             "sent": False,
             "win32_error": error,
-            "meaning": {2: "driver not loaded", 5: "access denied: run elevated"}.get(error, "CreateFileW failed"),
+            "meaning": {2: "driver not loaded (build/install TitanHide.sys and sc start it)", 5: "access denied: run elevated"}.get(error, "CreateFileW failed"),
             "hint": "install/start the TitanHide kernel driver first (titanhide_status shows the service state)",
         }
     try:
-        request = _TITANHIDE_REQUEST(system_pid, target_pid, options)
-        bytes_returned = wt.DWORD(0)
-        ok = _KERNEL32.DeviceIoControl(
-            handle, ioctl,
-            ctypes.byref(request), ctypes.sizeof(request),
-            None, 0,
-            ctypes.byref(bytes_returned), None,
+        request = _HIDE_INFO(command, hide_type, target_pid)
+        written = wt.DWORD(0)
+        ok = _KERNEL32.WriteFile(
+            handle, ctypes.byref(request), ctypes.sizeof(request), ctypes.byref(written), None
         )
+        last = ctypes.get_last_error()
         return {
             "sent": bool(ok),
-            "win32_error": None if ok else ctypes.get_last_error(),
-            "system_pid": system_pid,
+            "win32_error": None if ok else last,
+            "meaning": (None if ok else {5: "access denied: run elevated"}.get(last, "WriteFile failed")),
+            "command": command,
+            "system_pid_ignored": system_pid,
             "target_pid": target_pid,
-            "options": options,
+            "hide_type": hide_type,
+            "bytes_written": written.value,
         }
     finally:
         _KERNEL32.CloseHandle(handle)
@@ -703,11 +726,12 @@ def _titanhide_call(ioctl: int, system_pid: int, target_pid: int, options: int) 
 def titanhide_hide(target_pid: int, options: list[str] | None = None, *, system_pid: int = 4) -> dict[str, Any]:
     """Tell TitanHide to hide a PID behind the chosen anti-anti-debug shields.
 
-    ``options``: any of HideSystemDebugger, HideNtQueryInformationProcess,
-    HideNtSetInformationThread, HideNtQueryObject, HideNtQuerySystemInformation,
-    HideNtYieldExecution, HideNtGetContextThread, HideNtSetContextThread,
-    HideNtCreateThreadEx. Default: all of them. ``system_pid`` is the debugger's PID
-    (System=4 hides from everything).
+    ``options``: any of HideProcessDebugFlags, HideProcessDebugPort,
+    HideProcessDebugObjectHandle, HideDebugObject, HideSystemDebuggerInformation,
+    HideNtClose, HideThreadHideFromDebugger, HideNtGetContextThread,
+    HideNtSetContextThread, HideNtSystemDebugControl. Default: all of them.
+    ``system_pid`` is retained for backward compatibility but ignored (the
+    driver runs in System context).
     """
     if options is None:
         chosen = sum(_TITANHIDE_OPTIONS.values())
@@ -720,14 +744,14 @@ def titanhide_hide(target_pid: int, options: list[str] | None = None, *, system_
         used = options
     if not chosen:
         return {"error": "empty option set"}
-    result = _titanhide_call(_TITANHIDE_IOCTL_HIDE, system_pid, target_pid, chosen)
+    result = _titanhide_call(_TITAN_HIDE, target_pid, chosen, system_pid=system_pid)
     result["applied_options"] = used
     return result
 
 
 def titanhide_unhide(target_pid: int, *, system_pid: int = 4) -> dict[str, Any]:
     """Remove every TitanHide shield from a PID."""
-    return _titanhide_call(_TITANHIDE_IOCTL_UNHIDE, system_pid, target_pid, 0)
+    return _titanhide_call(_TITAN_UNHIDE, target_pid, sum(_TITANHIDE_OPTIONS.values()), system_pid=system_pid)
 
 
 # --------------------------------------------------------------------------

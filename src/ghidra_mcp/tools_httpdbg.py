@@ -65,14 +65,7 @@ _MCP_TOOL_DESCRIPTIONS = {
 
 for _tool, _doc in _MCP_TOOL_DESCRIPTIONS.items():
     def _make(tool: str, doc: str):
-        @mcp.tool()
         def _wrapped(params: str | None = None) -> str:
-            """Pass-through to the HTTP Debugger MCP tool.
-
-            ``params`` is an optional JSON object of tool-specific arguments
-            (e.g. {"transaction_id": "42"}, {"query": "api"}, {"page": 1}).
-            Call httpdbg_mcp_get_session first to open the bridge channel.
-            """
             try:
                 parsed = None
                 if params:
@@ -81,11 +74,65 @@ for _tool, _doc in _MCP_TOOL_DESCRIPTIONS.items():
                 return render(httpdbg_mcp.call(tool, parsed))
             except Exception as exc:
                 return fail(exc)
-        _wrapped.__name__ = f"httpdbg_mcp_{_tool}"
-        _wrapped.__doc__ = doc
+
+        # The name and docstring MUST be set before @mcp.tool() runs: FastMCP reads
+        # fn.__name__ / fn.__doc__ at decoration time, so setting them afterwards
+        # registered all eight wrappers under the single name "_wrapped" and seven
+        # of the official tools silently disappeared from the server.
+        _wrapped.__name__ = f"httpdbg_mcp_{tool}"
+        _wrapped.__qualname__ = _wrapped.__name__
+        _wrapped.__doc__ = (
+            f"{doc}\n\n"
+            "`params` is an optional JSON object of tool-specific arguments "
+            '(e.g. {"transaction_id": "42"}, {"query": "api"}, {"page": 1}). '
+            "Call httpdbg_mcp_get_session first to open the bridge channel."
+        )
         return _wrapped
 
-    _make(_tool, _doc)
+    mcp.tool()(_make(_tool, _doc))
+
+
+@mcp.tool()
+def httpdbg_mcp_list_tools() -> str:
+    """Full tool set of the HTTP Debugger MCP bridge (tools/list), with schemas.
+
+    Returns every tool the installed bridge exposes - not just the 8 documented
+    ones - with parameter names, types, descriptions and which are required. Call
+    httpdbg_mcp_get_session first, then pass any returned name to
+    httpdbg_mcp_call to use the whole program.
+    """
+    try:
+        return render(httpdbg_mcp.list_tools())
+    except Exception as exc:
+        return fail(exc)
+
+
+@mcp.tool()
+def httpdbg_mcp_call(tool: str, params: str | None = None) -> str:
+    """Call ANY tool exposed by the HTTP Debugger MCP bridge by name (full pass-through).
+
+    `tool` is a bridge tool name (see httpdbg_mcp_list_tools, e.g.
+    "list_transactions"), `params` an optional JSON object of arguments. This
+    reaches every capability the bridge offers, including tools newer than the
+    8 documented wrappers. Call httpdbg_mcp_get_session first.
+    """
+    try:
+        parsed = None
+        if params:
+            import json
+            parsed = json.loads(params)
+        return render(httpdbg_mcp.call(tool, parsed))
+    except Exception as exc:
+        return fail(exc)
+
+
+@mcp.tool()
+def httpdbg_mcp_stop_session() -> str:
+    """Stop the HTTP Debugger MCP bridge subprocess and close the channel."""
+    try:
+        return render(httpdbg_mcp.stop_session())
+    except Exception as exc:
+        return fail(exc)
 
 
 @mcp.tool()

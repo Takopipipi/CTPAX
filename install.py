@@ -1404,6 +1404,78 @@ def codex_config_path() -> Path:
     return Path(os.environ.get("USERPROFILE", str(Path.home()))) / ".codex" / "config.toml"
 
 
+# ---------------------------------------------------------------------------
+# MCP client registration: Claude Desktop and Cline (VS Code)
+# ---------------------------------------------------------------------------
+def claude_desktop_config_path() -> Path:
+    appdata = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+    return Path(appdata) / "Claude" / "claude_desktop_config.json"
+
+
+def _register_mcp_json_config(path: Path, label: str, entry: dict) -> bool:
+    """Write ``mcpServers.ghidra`` into a plain-JSON client config, keeping the rest."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    original = path.read_text(encoding="utf-8-sig") if path.is_file() else ""
+    try:
+        data = json.loads(original) if original.strip() else {}
+    except Exception as exc:
+        out.warn(f"could not parse {path} ({exc}); leaving {label} untouched")
+        return False
+    if not isinstance(data, dict):
+        out.warn(f"{path} is not a JSON object; leaving {label} untouched")
+        return False
+    if original.strip():
+        backup = path.with_name(f"{path.name}.backup-{time.strftime('%Y%m%d-%H%M%S')}")
+        backup.write_text(original, encoding="utf-8")
+    servers = data.get("mcpServers")
+    if not isinstance(servers, dict):
+        servers = {}
+        data["mcpServers"] = servers
+    servers[MCP_SERVER_NAME] = entry
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    out.ok(f"mcpServers.{MCP_SERVER_NAME} in {path}")
+    return True
+
+
+def register_with_claude_desktop(python: Path, source_root: Path, home: Path,
+                                 ghidra_dir: Path, java_home: Path, extra_env: dict[str, str] | None = None) -> bool:
+    """Add mcpServers.ghidra to Claude Desktop's claude_desktop_config.json."""
+    out.step("Registering the MCP server in Claude Desktop")
+    entry = _claude_entry(python, source_root, home, ghidra_dir, java_home, extra_env)
+    return _register_mcp_json_config(claude_desktop_config_path(), "Claude Desktop", entry)
+
+
+def cline_config_path() -> Path:
+    appdata = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+    return Path(appdata) / "Code" / "User" / "globalStorage" / "saoudrizwan.claude-dev" / "settings" / "cline_mcp_settings.json"
+
+
+def _unregister_mcp_json_config(path: Path) -> bool:
+    """Remove ``mcpServers.ghidra`` from a plain-JSON client config. True when removed."""
+    if not path.is_file():
+        return False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except Exception:
+        return False
+    servers = data.get("mcpServers") if isinstance(data, dict) else None
+    if not isinstance(servers, dict) or MCP_SERVER_NAME not in servers:
+        return False
+    backup = path.with_name(f"{path.name}.backup-{time.strftime('%Y%m%d-%H%M%S')}")
+    backup.write_text(path.read_text(encoding="utf-8-sig"), encoding="utf-8")
+    del servers[MCP_SERVER_NAME]
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return True
+
+
+def register_with_cline(python: Path, source_root: Path, home: Path,
+                        ghidra_dir: Path, java_home: Path, extra_env: dict[str, str] | None = None) -> bool:
+    """Add mcpServers.ghidra to Cline's MCP settings (VS Code extension storage)."""
+    out.step("Registering the MCP server in Cline (VS Code)")
+    entry = _claude_entry(python, source_root, home, ghidra_dir, java_home, extra_env)
+    return _register_mcp_json_config(cline_config_path(), "Cline", entry)
+
+
 def _toml_string(value: str) -> str:
     return json.dumps(value)
 
@@ -1506,6 +1578,8 @@ def detect_clients() -> dict[str, bool]:
         "cursor": bool(shutil.which("cursor")) or (home / ".cursor").is_dir(),
         "claude": bool(shutil.which("claude")) or claude_config_path().is_file(),
         "codex": bool(shutil.which("codex")) or (home / ".codex").is_dir(),
+        "claude_desktop": claude_desktop_config_path().parent.is_dir() or claude_desktop_config_path().is_file(),
+        "cline": cline_config_path().parent.is_dir() or cline_config_path().is_file(),
     }
 
 
@@ -2018,6 +2092,8 @@ def do_install(arguments: argparse.Namespace) -> int:
         "cursor": bool(arguments.cursor or arguments.all_clients),
         "claude": bool(arguments.claude or arguments.all_clients),
         "codex": bool(arguments.codex or arguments.all_clients),
+        "claude_desktop": bool(getattr(arguments, "claude_desktop", False) or arguments.all_clients),
+        "cline": bool(getattr(arguments, "cline", False) or arguments.all_clients),
     }
     if getattr(arguments, "no_register", False):
         out.warn("--no-register: AI client configs are left untouched")
@@ -2061,6 +2137,16 @@ def do_install(arguments: argparse.Namespace) -> int:
             register_with_codex(python, source_root, home, ghidra_dir, java_home, extra_env=client_env)
         else:
             out.warn("no Codex detected; skipping registration")
+    if register_flags["claude_desktop"]:
+        if clients["claude_desktop"]:
+            register_with_claude_desktop(python, source_root, home, ghidra_dir, java_home, extra_env=client_env)
+        else:
+            out.warn("no Claude Desktop detected; skipping registration")
+    if register_flags["cline"]:
+        if clients["cline"]:
+            register_with_cline(python, source_root, home, ghidra_dir, java_home, extra_env=client_env)
+        else:
+            out.warn("no Cline (VS Code) detected; skipping registration")
     _tick("registrations done", 0.98)
 
     print()
@@ -2078,6 +2164,10 @@ def do_install(arguments: argparse.Namespace) -> int:
         print(f"  Claude Code     {claude_config_path()}")
     if register_flags["codex"]:
         print(f"  Codex config    {codex_config_path()}")
+    if register_flags["claude_desktop"] and clients.get("claude_desktop"):
+        print(f"  Claude Desktop  {claude_desktop_config_path()}")
+    if register_flags["cline"] and clients.get("cline"):
+        print(f"  Cline (VS Code) {cline_config_path()}")
     print()
     print("  Restart OpenCode, then try:")
     print('    "run doctor from the ghidra mcp"')
@@ -2169,6 +2259,12 @@ def do_uninstall(arguments: argparse.Namespace) -> int:
     if not (claude_config_path().is_file() or codex_config_path().is_file()):
         out.info("neither Claude Code nor Codex configs are on this machine")
 
+    out.step("Removing the Claude Desktop / Cline registrations if present")
+    if _unregister_mcp_json_config(claude_desktop_config_path()):
+        out.ok("removed mcpServers.ghidra from Claude Desktop")
+    if _unregister_mcp_json_config(cline_config_path()):
+        out.ok("removed mcpServers.ghidra from Cline (VS Code)")
+
     out.step("Removing the installation")
     if not home.exists():
         out.info(f"{home} does not exist")
@@ -2207,7 +2303,9 @@ def main() -> int:
     parser.add_argument("--cursor-config", help="path to a Cursor mcp.json (default: ~/.cursor/mcp.json)")
     parser.add_argument("--claude", action="store_true", help="also register in Claude Code (~/.claude.json)")
     parser.add_argument("--codex", action="store_true", help="also register in Codex (~/.codex/config.toml)")
-    parser.add_argument("--all-clients", action="store_true", help="register in every AI client detected on this machine (opencode, cursor, claude code, codex)")
+    parser.add_argument("--claude-desktop", action="store_true", help="also register in Claude Desktop (claude_desktop_config.json)")
+    parser.add_argument("--cline", action="store_true", help="also register in Cline (VS Code cline_mcp_settings.json)")
+    parser.add_argument("--all-clients", action="store_true", help="register in every AI client detected on this machine (opencode, cursor, claude code, codex, claude desktop, cline)")
     parser.add_argument("--yes", action="store_true", help="never prompt: download prerequisites automatically and answer defaults (used by CTPAX)")
     parser.add_argument("--heap", default="4G", help="JVM maximum heap for analysis (default 4G)")
     parser.add_argument("--recreate-venv", action="store_true", help="rebuild the virtual environment from scratch")

@@ -1,18 +1,29 @@
+# local state - never publish
+venv/
+projects/
+logs/
+certs/
+bin/
+installer/
 __pycache__/
 *.pyc
+*.pyo
 *.bak
 *.backup-*
 .env
 *.key
 *.pem
 GhidraMCP/
-projects/
-notes.json
 config.json
+notes.json
+version_cache.json
 *.log
 *.etl
 *.pcap
 *.jsonl
-build/
+
+# build artifacts
 dist/
+build/
 *.spec
+_*.zip

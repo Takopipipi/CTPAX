@@ -118,6 +118,16 @@ Suggested order of work on an unknown binary:
     ghidra-mcp-custom/ (validated on the spot). `nuclei_install`/`nuclei_templates_update`
     fetch the binary and repo when missing. Lab/owned targets only.
 21. `crypto_*` - identify and undo encoding and encryption.
+22. HTTP Debugger traffic (`httpdbg_status` first): `httpdbg_launch` opens the app,
+    `httpdbg_mcp_get_session` bridges the official HTTPDebuggerMcp.exe (enable it once
+    in Settings -> MCP Server), then `httpdbg_mcp_list_transactions` /
+    `httpdbg_mcp_get_transaction` / `httpdbg_mcp_search_transactions` read captured
+    traffic; `httpdbg_mcp_list_tools` + `httpdbg_mcp_call` reach every bridge tool.
+23. Cheat Engine itself (`ce_status` first): `ce_launch` installs a Lua mailbox bridge
+    into CE's autorun\ folder (CE runs those scripts at startup); once the heartbeat is
+    fresh, `ce_lua` executes ANY Cheat Engine Lua - `ce_attach`, `ce_read`/`ce_write`,
+    `ce_assemble` are typed shortcuts, while createMemScan/debug_*/address-list APIs go
+    through ce_lua directly. Without CE the native `mem_*` tools do the same scanning.
 
 For anything that may take minutes, use `job_start` and poll `job_status`.
 If a Ghidra tool fails, run `doctor` before anything else.

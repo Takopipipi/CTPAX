@@ -435,4 +435,11 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    _exit_code = main()
+    if getattr(sys, "frozen", False):
+        # The exe opens its own console window: keep it readable after the summary.
+        try:
+            input("\n  Press Enter to close ...")
+        except EOFError:
+            pass
+    sys.exit(_exit_code)
